@@ -421,36 +421,72 @@ const HTTP_ACTION_MAP = {
   '/get_current_tab': 'get_current_tab',
 };
 
-// ─── 尝试作为主实例启动 ───
-async function startAsPrimary() {
+// ─── 主动探活:已有健康主实例？ ───
+// macOS 双栈下 IPv6/IPv4 同端口不报 EADDRINUSE，盲听会裂脑；启动前先探活兜底。
+// 用内置 http 模块而非 fetch，兼容 Node 16(fetch/AbortSignal.timeout 在 16 不可用)。
+// 返回:'primary'=本工具主实例就位 | 'foreign'=端口被陌生服务占用 | 'none'=无人应答
+function probePrimaryHealth() {
   return new Promise((resolve) => {
-    const wssHttpServer = http.createServer();
-    wssHttpServer.on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        console.error(`[bridge] Port ${WS_PORT} occupied, switching to PROXY mode...`);
-        isProxy = true;
-        resolve(null);
-        return;
+    const req = http.request(
+      { hostname: '127.0.0.1', port: HTTP_PORT, path: '/health', method: 'GET', timeout: 800 },
+      (res) => {
+        let data = '';
+        res.on('data', (c) => {
+          data += c;
+          // 探活响应本应很小；陌生服务撞端口回超大 body 时截断防吃内存
+          if (data.length > 65536) { res.destroy(); resolve('foreign'); }
+        });
+        res.on('end', () => {
+          if (res.statusCode !== 200) { resolve('foreign'); return; }
+          try {
+            const j = JSON.parse(data);
+            // 指纹 + 端口双校验，确认对端确是本工具而非撞端口的陌生服务
+            if (j.service === 'browser-link-tool' && j.status === 'primary'
+                && j.wsPort === WS_PORT && j.httpPort === HTTP_PORT) {
+              resolve('primary');
+            } else {
+              resolve('foreign'); // 有人应答但不是本工具
+            }
+          } catch { resolve('foreign'); }
+        });
       }
-      throw err;
-    });
-    wssHttpServer.listen(WS_PORT, '127.0.0.1', () => {
-      console.error(`[bridge] PRIMARY mode: WebSocket listening on 127.0.0.1:${WS_PORT}`);
-      resolve(wssHttpServer);
+    );
+    req.on('error', () => resolve('none')); // 拒连=端口空闲
+    req.on('timeout', () => { req.destroy(); resolve('none'); });
+    req.end();
+  });
+}
+
+// ─── 原子绑定:WS(48765) 与 HTTP(48766) 全绑成功才算主实例 ───
+// 任一端口失败 → 回滚关闭已绑 server，降级 PROXY，绝不 process.exit。
+function bindPortAtomic(server, port) {
+  return new Promise((resolve) => {
+    const onError = () => resolve(false); // EADDRINUSE 等一律降级
+    server.once('error', onError);
+    server.listen(port, '127.0.0.1', () => {
+      server.removeListener('error', onError);
+      resolve(true);
     });
   });
 }
 
 // ─── 主实例完整逻辑 ───
-function setupPrimaryInstance(wssHttpServer) {
-  const wss = new WebSocketServer({ server: wssHttpServer });
+// wssHttpServer(48765)、httpServer(48766) 均已由 tryStartPrimary 原子绑定成功后传入。
+function setupPrimaryInstance(wssHttpServer, httpServer) {
+  // maxPayload 提到 512MB:大页面 snapshot / eval 大对象可能超 ws 默认 100MB 上限，
+  // 否则会触发 1009 错误。配合下方 ws.on('error') 兜底，双重防崩。
+  const wss = new WebSocketServer({ server: wssHttpServer, maxPayload: 512 * 1024 * 1024 });
+
+  // 运行期 error 监听:bindPortAtomic 成功后移除了绑定期的临时监听器，
+  // 若不重挂，运行时 socket 错误(ECONNRESET/EMFILE 等)会因 'error' 无监听器直接 throw 崩溃主进程。
+  wssHttpServer.on('error', (err) => console.error(`[bridge] WS server runtime error: ${err.message}`));
+  httpServer.on('error', (err) => console.error(`[bridge] HTTP server runtime error: ${err.message}`));
 
   let activeClient = null;
-  let lastTabInfo = null;
   let pendingRequests = new Map();
   let currentId = 1;
 
-  const httpServer = http.createServer((req, res) => {
+  httpServer.on('request', (req, res) => {
     const url = req.url;
 
     const handleBrowserAction = (action, extraPayload = {}) => {
@@ -493,6 +529,7 @@ function setupPrimaryInstance(wssHttpServer) {
     if (url === "/health") {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
+        service: "browser-link-tool", // 指纹:供探活确认对端确是本工具而非撞端口的陌生服务
         status: "primary",
         mode: "primary",
         connected: !!(activeClient && activeClient.readyState === 1),
@@ -524,15 +561,7 @@ function setupPrimaryInstance(wssHttpServer) {
     }
   });
 
-  httpServer.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`[bridge] HTTP port ${HTTP_PORT} in use, exiting...`);
-      process.exit(1);
-    }
-  });
-  httpServer.listen(HTTP_PORT, '127.0.0.1', () => {
-    console.error(`[bridge] PRIMARY mode: HTTP listening on 127.0.0.1:${HTTP_PORT}`);
-  });
+  console.error(`[bridge] PRIMARY mode: HTTP listening on 127.0.0.1:${HTTP_PORT}`);
 
   // Hot Reload 文件监听
   let debounceTimer = null;
@@ -557,6 +586,9 @@ function setupPrimaryInstance(wssHttpServer) {
   wss.on('connection', (ws) => {
     activeClient = ws;
     console.error('[bridge] Chrome Extension connected');
+    // 每个连接必须挂 error 监听:否则 ws 抛错(如超大 payload 触发 1009)在实例上发 'error'
+    // 事件而无监听器时，Node 会直接 throw 崩溃主进程、断开浏览器。
+    ws.on('error', (e) => console.error(`[bridge] WS connection error: ${e.message}`));
     ws.on('message', (message) => {
       try {
         const data = JSON.parse(message.toString());
@@ -601,11 +633,14 @@ async function callTool(request) {
 
   bumpIdleTimer(); // 每次工具调用视为一次交互，重置空闲计时
 
-  // 代理模式先探活
+  // 代理模式先探活:校验对端确是本工具主实例，再看浏览器是否在线
   if (isProxy) {
     try {
       const healthText = await proxyHttpRequest('/health', 'GET');
       const health = JSON.parse(healthText);
+      if (health.service !== 'browser-link-tool' || health.status !== 'primary') {
+        return { content: [{ type: "text", text: `Error: Port ${HTTP_PORT} is occupied by a non-browser-link service; cannot forward.` }], isError: true };
+      }
       if (!health.connected) {
         return { content: [{ type: "text", text: "Error: Primary bridge reports no Chrome Extension connected." }], isError: true };
       }
@@ -643,12 +678,53 @@ async function callTool(request) {
   }
 }
 
-// ─── 启动主流程 ───
-const wssHttpServer = await startAsPrimary();
-let primaryResources = null;
-if (!isProxy && wssHttpServer) {
-  primaryResources = setupPrimaryInstance(wssHttpServer);
+// ─── 尝试晋升主实例:探活 → 原子绑定 → 失败即降级 PROXY ───
+async function tryStartPrimary() {
+  // 1. 探活优先
+  const probe = await probePrimaryHealth();
+  if (probe === 'primary') {
+    // 本工具主实例已就位，自觉转 PROXY，不争端口
+    console.error(`[bridge] Active primary instance detected on :${HTTP_PORT}, running in PROXY mode.`);
+    isProxy = true;
+    return null;
+  }
+  if (probe === 'foreign') {
+    // 端口被非本工具服务占用(或本工具正在启动、/health 尚未就绪)。
+    // 不 exit(避免误杀竞态中的正常场景)、也不抢端口,降级 PROXY;
+    // 运行期 callTool 的探活会对每次调用二次校验,对端不可用时返回明确错误。
+    console.error(`[bridge] Port ${HTTP_PORT} answered but not as browser-link primary; running in PROXY mode (will re-verify per call).`);
+    isProxy = true;
+    return null;
+  }
+
+  // 2. 端口空闲(probe==='none') → 原子绑定 WS(48765) + HTTP(48766)
+  const wssHttpServer = http.createServer();
+  const httpServer = http.createServer();
+  const rollback = (reason) => {
+    console.error(`[bridge] ${reason}, rolling back to PROXY mode.`);
+    try { wssHttpServer.close(); } catch {}
+    try { httpServer.close(); } catch {}
+    isProxy = true;
+    return null;
+  };
+
+  if (!(await bindPortAtomic(wssHttpServer, WS_PORT))) {
+    // 探活扑空但 WS 已被占:典型竞态(另一进程刚抢先绑定)，降级 PROXY 让它当主
+    return rollback(`WS port ${WS_PORT} occupied`);
+  }
+  console.error(`[bridge] PRIMARY mode: WebSocket listening on 127.0.0.1:${WS_PORT}`);
+
+  if (!(await bindPortAtomic(httpServer, HTTP_PORT))) {
+    // WS 已绑成功但 HTTP 冲突 → 必须先关掉 WS 再降级，否则占着端口空转
+    return rollback(`HTTP port ${HTTP_PORT} occupied (WS already bound, releasing)`);
+  }
+
+  return setupPrimaryInstance(wssHttpServer, httpServer);
 }
+
+// ─── 启动主流程 ───
+let primaryResources = await tryStartPrimary();
+// primaryResources 为 null 说明当前进程作为 PROXY 运行，请求透明转发至 127.0.0.1:48766。
 
 const server = new Server(
   { name: "browser_link_tool", version: "1.0.0" },
