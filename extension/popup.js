@@ -1,28 +1,12 @@
 /**
  * Browser Link Tool - Popup Controller
- * 信息+控制一体面板：连接状态 / 当前生效 tab / 全部 tab 列表可切换 / 快捷操作
- * tab 数据直接走 chrome API；bridge 存活状态走 HTTP :48766/health
+ * 面板:连接状态 / 活跃会话列表(谁在操作哪个 tab)/ 快捷操作
+ * 状态与会话走 HTTP :48766/health;复制走 chrome tabs API
  */
 
 const HEALTH_URL = 'http://127.0.0.1:48766/health';
-const LOCKED_TAB_KEY = 'lockedTabId';
 
 const el = (id) => document.getElementById(id);
-
-async function getLockedTabId() {
-  try {
-    const o = await chrome.storage.local.get(LOCKED_TAB_KEY);
-    const v = o && o[LOCKED_TAB_KEY];
-    return typeof v === 'number' ? v : null;
-  } catch (e) { return null; }
-}
-
-async function setLockedTabId(id) {
-  try {
-    if (id == null) await chrome.storage.local.remove(LOCKED_TAB_KEY);
-    else await chrome.storage.local.set({ [LOCKED_TAB_KEY]: id });
-  } catch (e) {}
-}
 
 function setDot(id, state) {
   const dot = el(id);
@@ -38,13 +22,96 @@ async function refreshBridgeStatus() {
     el('bridgeValue').textContent = `运行中 :${data.httpPort || 48766}`;
     setDot('extDot', data.connected ? 'on' : 'off');
     el('extValue').textContent = data.connected ? '已连接' : '未连接';
-    el('modeValue').textContent = data.mode === 'primary' ? '主实例 (primary)' : (data.mode || '—');
+    await renderSessions(Array.isArray(data.sessions) ? data.sessions : []);
   } catch (e) {
     setDot('bridgeDot', 'off');
     el('bridgeValue').textContent = '未运行';
     setDot('extDot', 'idle');
     el('extValue').textContent = '—';
-    el('modeValue').textContent = '—';
+    await renderSessions([]);
+  }
+}
+
+function fmtDuration(ms) {
+  if (ms == null || ms < 0) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m % 60}m`;
+}
+
+function clientBadgeClass(client) {
+  const c = String(client || '').toLowerCase();
+  if (c.includes('claude')) return 'badge-claude';
+  if (c.includes('gemini')) return 'badge-gemini';
+  if (c.includes('codex')) return 'badge-codex';
+  return 'badge-unknown';
+}
+
+async function tabTitleOf(tabId) {
+  if (tabId == null) return null;
+  try { const t = await chrome.tabs.get(tabId); return t ? (t.title || t.url || `#${tabId}`) : null; }
+  catch (e) { return null; }
+}
+
+async function renderSessions(sessions) {
+  el('sessionCount').textContent = String(sessions.length);
+  const list = el('sessionList');
+  list.innerHTML = '';
+  if (sessions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'session-empty';
+    empty.textContent = '无近期活跃会话';
+    list.appendChild(empty);
+    return;
+  }
+  for (const s of sessions) {
+    const item = document.createElement('div');
+    item.className = 'session-item';
+
+    const head = document.createElement('div');
+    head.className = 'session-head';
+    // 活跃状态点:绿=近期有调用,灰=连着但空闲
+    const dot = document.createElement('span');
+    dot.className = 'session-dot ' + (s.active ? 'active' : 'idle');
+    dot.title = s.active ? '活跃(近期有操作)' : '在线空闲';
+    const badge = document.createElement('span');
+    badge.className = 'client-badge ' + clientBadgeClass(s.client);
+    badge.textContent = s.client && s.client !== 'unknown' ? s.client : '未知客户端';
+    const mode = document.createElement('span');
+    mode.className = 'session-mode' + (s.mode === 'primary' ? ' primary' : '');
+    mode.textContent = s.mode === 'primary' ? '主' : '代理';
+    const pid = document.createElement('span');
+    pid.className = 'session-pid';
+    pid.textContent = s.pid ? `pid ${s.pid}` : '';
+    head.appendChild(dot);
+    head.appendChild(badge);
+    head.appendChild(mode);
+    head.appendChild(pid);
+    item.appendChild(head);
+
+    // 操作行:工具 → 目标标签页标题(tabId 已展示在上面 head 行末尾)
+    const opRow = document.createElement('div');
+    opRow.className = 'session-op';
+    let tabDesc;
+    if (s.lastTabId != null) {
+      const title = s.lastTabTitle || await tabTitleOf(s.lastTabId);
+      tabDesc = title || `标签页 #${s.lastTabId}`;
+    } else {
+      tabDesc = s.lastTool ? '活动标签页' : '暂无操作';
+    }
+    opRow.textContent = s.lastTool ? `${s.lastTool} → ${tabDesc}` : tabDesc;
+    item.appendChild(opRow);
+
+    const meta = document.createElement('div');
+    meta.className = 'session-meta';
+    const activeDesc = s.idleMs != null ? `最近操作 ${fmtDuration(s.idleMs)}前` : '尚未操作';
+    meta.textContent = `接入 ${fmtDuration(s.uptimeMs)} · ${activeDesc} · ${s.calls} 次调用`;
+    item.appendChild(meta);
+
+    list.appendChild(item);
   }
 }
 
@@ -52,82 +119,6 @@ async function getActiveTab() {
   let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tabs || tabs.length === 0) tabs = await chrome.tabs.query({ active: true });
   return tabs && tabs.length > 0 ? tabs[0] : null;
-}
-
-function renderActiveTab(tab, isLocked) {
-  const badge = el('lockBadge');
-  const toggle = el('lockToggle');
-  if (!tab) {
-    el('activeTabTitle').textContent = isLocked ? '锁定的标签页已关闭' : '无活动标签页';
-    el('activeTabUrl').textContent = '—';
-    el('activeTabId').textContent = '';
-    badge.hidden = true;
-    toggle.classList.remove('on');
-    return;
-  }
-  el('activeTabTitle').textContent = tab.title || '(无标题)';
-  el('activeTabUrl').textContent = tab.url || '';
-  el('activeTabId').textContent = `tabId: ${tab.id}`;
-  badge.hidden = !isLocked;
-  toggle.classList.toggle('on', !!isLocked);
-}
-
-async function renderTabList(lockedId) {
-  const tabs = await chrome.tabs.query({});
-  el('tabCount').textContent = String(tabs.length);
-  const list = el('tabList');
-  list.innerHTML = '';
-
-  for (const tab of tabs) {
-    const item = document.createElement('div');
-    item.className = 'tab-item' + (tab.active ? ' active' : '') + (tab.id === lockedId ? ' locked' : '');
-    item.title = tab.url || '';
-
-    if (tab.favIconUrl && /^https?:/.test(tab.favIconUrl)) {
-      const img = document.createElement('img');
-      img.className = 'tab-fav';
-      img.src = tab.favIconUrl;
-      img.onerror = () => { img.replaceWith(makeFallback()); };
-      item.appendChild(img);
-    } else {
-      item.appendChild(makeFallback());
-    }
-
-    const body = document.createElement('div');
-    body.className = 'tab-item-body';
-    const t = document.createElement('div');
-    t.className = 'tab-item-title';
-    t.textContent = tab.title || '(无标题)';
-    const m = document.createElement('div');
-    m.className = 'tab-item-meta';
-    m.textContent = hostOf(tab.url);
-    body.appendChild(t);
-    body.appendChild(m);
-    item.appendChild(body);
-
-    const idSpan = document.createElement('span');
-    idSpan.className = 'tab-item-id';
-    idSpan.textContent = '#' + tab.id;
-    item.appendChild(idSpan);
-
-    item.addEventListener('click', async () => {
-      await chrome.tabs.update(tab.id, { active: true });
-      try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) {}
-      await refreshAll();
-    });
-
-    list.appendChild(item);
-  }
-}
-
-function makeFallback() {
-  const d = document.createElement('div');
-  d.className = 'tab-fav-fallback';
-  return d;
-}
-
-function hostOf(url) {
-  try { return new URL(url).host; } catch (e) { return url || ''; }
 }
 
 function toast(text) {
@@ -138,45 +129,12 @@ function toast(text) {
   setTimeout(() => { t.classList.remove('flash'); t.textContent = prev; }, 1600);
 }
 
-async function refreshAll() {
-  const lockedId = await getLockedTabId();
-  let effectiveTab = null;
-  let isLocked = false;
-  if (lockedId != null) {
-    try {
-      effectiveTab = await chrome.tabs.get(lockedId);
-      isLocked = true;
-    } catch (e) {
-      // 锁定 tab 已关闭 → 清锁,回退活动 tab
-      await setLockedTabId(null);
-      isLocked = false;
-    }
-  }
-  if (!effectiveTab) effectiveTab = await getActiveTab();
-  renderActiveTab(effectiveTab, isLocked);
-  await Promise.all([refreshBridgeStatus(), renderTabList(isLocked ? lockedId : null)]);
-}
-
 // --- Events ---
-el('refreshBtn').addEventListener('click', () => { refreshAll(); toast('已刷新'); });
-
-el('lockToggle').addEventListener('click', async () => {
-  const lockedId = await getLockedTabId();
-  if (lockedId != null) {
-    await setLockedTabId(null);
-    toast('已解锁,恢复跟随活动标签页');
-  } else {
-    const active = await getActiveTab();
-    if (!active) { toast('无活动标签页可锁定'); return; }
-    await setLockedTabId(active.id);
-    toast(`已锁定 #${active.id},切换标签页不再影响`);
-  }
-  await refreshAll();
-});
+el('refreshBtn').addEventListener('click', () => { refreshBridgeStatus(); toast('已刷新'); });
 
 el('copyBtn').addEventListener('click', async () => {
   const tab = await getActiveTab();
-  if (!tab) return;
+  if (!tab) { toast('无活动标签页'); return; }
   const text = `tabId: ${tab.id}\ntitle: ${tab.title}\nurl: ${tab.url}`;
   try {
     await navigator.clipboard.writeText(text);
@@ -186,4 +144,19 @@ el('copyBtn').addEventListener('click', async () => {
   }
 });
 
-refreshAll();
+// --- 自动刷新:popup 打开期间每 3 秒刷新一次;页面隐藏时暂停,恢复时立即刷新 ---
+let autoTimer = null;
+function startAutoRefresh() {
+  if (autoTimer) return;
+  autoTimer = setInterval(refreshBridgeStatus, 3000);
+}
+function stopAutoRefresh() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopAutoRefresh();
+  else { refreshBridgeStatus(); startAutoRefresh(); }
+});
+
+refreshBridgeStatus();
+startAutoRefresh();

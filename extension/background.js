@@ -54,35 +54,98 @@ async function clearLockedTab() {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   const locked = await getLockedTabId();
   if (locked != null && locked === tabId) await clearLockedTab();
+  await unbindClosedTab(tabId); // 该 tab 被任何会话绑定的,一并解绑
 });
 
+// ─── 会话 ↔ tab 绑定:每个 agent 会话独立锁定自己操作的 tab(多会话互不干扰)───
+// 存 chrome.storage.local 的对象 map { sessionId: tabId }。可重绑:会话每次显式带 tabId 即更新。
+const SESSION_BIND_KEY = 'sessionTabBindings';
+
+async function getBindings() {
+  try {
+    const o = await chrome.storage.local.get(SESSION_BIND_KEY);
+    return (o && o[SESSION_BIND_KEY]) || {};
+  } catch (e) { return {}; }
+}
+// 串行化所有 read-modify-write:storage 异步,多会话并发写会互相覆盖(后写者丢前写者),
+// 用一条 Promise 链把写操作排队,保证读-改-写原子。
+let bindWriteChain = Promise.resolve();
+function mutateBindings(fn) {
+  bindWriteChain = bindWriteChain.then(async () => {
+    try {
+      const b = await getBindings();
+      if (fn(b)) await chrome.storage.local.set({ [SESSION_BIND_KEY]: b });
+    } catch (e) {}
+  });
+  return bindWriteChain;
+}
+async function setBinding(sessionId, tabId) {
+  if (!sessionId) return;
+  await mutateBindings((b) => { b[sessionId] = tabId; return true; });
+}
+async function getBinding(sessionId) {
+  if (!sessionId) return null;
+  const b = await getBindings();
+  const v = b[sessionId];
+  return typeof v === 'number' ? v : null;
+}
+async function unbindClosedTab(tabId) {
+  await mutateBindings((b) => {
+    let changed = false;
+    for (const k of Object.keys(b)) { if (b[k] === tabId) { delete b[k]; changed = true; } }
+    return changed;
+  });
+}
+
+// 记录每次调用 resolve 到的真实 tab(按 msg.id),供 send 回传给 bridge 更新面板显示
+const resolvedTabByMsgId = new Map();
 async function resolveTab(msg) {
+  const tab = await resolveTabInner(msg);
+  if (msg && msg.id != null && tab) {
+    resolvedTabByMsgId.set(msg.id, { tabId: tab.id, title: tab.title || '' });
+  }
+  return tab;
+}
+
+async function resolveTabInner(msg) {
+  const sid = msg && msg.__session;
   if (msg && msg.tabId != null) {
     try {
       const tab = await chrome.tabs.get(Number(msg.tabId));
-      if (tab) return tab;
+      if (tab) { await setBinding(sid, tab.id); return tab; } // 显式 tabId 更新会话绑定
     } catch (e) { /* fall through */ }
     throw new Error(`Tab ${msg.tabId} not found`);
   }
   if (msg && msg.urlMatch) {
     const tabs = await chrome.tabs.query({});
     const hit = tabs.find(t => t.url && t.url.includes(msg.urlMatch));
-    if (hit) return hit;
+    if (hit) { await setBinding(sid, hit.id); return hit; }
     throw new Error(`No tab matching url "${msg.urlMatch}"`);
   }
-  // 锁定 tab 优先于活动 tab(但低于上面的显式 tabId / urlMatch)
+  // 无显式目标:优先该会话已绑定的 tab(每会话独立)
+  const boundId = await getBinding(sid);
+  if (boundId != null) {
+    try {
+      const tab = await chrome.tabs.get(boundId);
+      if (tab) return tab;
+    } catch (e) {
+      await unbindClosedTab(boundId); // 绑定 tab 已关,解绑后继续回退
+    }
+  }
+  // 会话无绑定 → 退全局锁(popup 手动锁,作跨会话兜底)
   const lockedId = await getLockedTabId();
   if (lockedId != null) {
     try {
       const tab = await chrome.tabs.get(lockedId);
-      if (tab) return tab;
+      if (tab) { await setBinding(sid, tab.id); return tab; }
     } catch (e) {
-      // 锁定 tab 已不存在(极端情况漏了 onRemoved),清锁后回退活动 tab
       await clearLockedTab();
     }
   }
+  // 最终回退活动 tab,并绑定给该会话(此后该会话钉在此 tab,直到显式改)
   const active = await getActiveTab();
   if (!active) throw new Error('No active tab found (Browser might be fully hidden)');
+  await setBinding(sid, active.id);
   return active;
 }
 
@@ -121,7 +184,10 @@ async function evaluateViaDebugger(tabId, code) {
 
 function send(id, payload) {
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ id, ...payload }));
+    // 附带本次实际操作的 tab(供 bridge 面板显示"谁在操作哪个 tab"),随后清理
+    const rt = resolvedTabByMsgId.get(id);
+    if (rt) resolvedTabByMsgId.delete(id);
+    socket.send(JSON.stringify({ id, ...payload, __resolvedTab: rt || null }));
   }
 }
 

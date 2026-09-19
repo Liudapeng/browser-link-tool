@@ -38,44 +38,23 @@
           <span class="status-label">扩展连接</span>
           <span class="status-value" id="extValue">检测中…</span>
         </div>
-        <div class="status-row">
-          <span class="status-dot idle"></span>
-          <span class="status-label">运行模式</span>
-          <span class="status-value" id="modeValue">—</span>
-        </div>
       </div>
     </div>
 
-    <!-- Active Tab -->
+    <!-- Active Agent Sessions -->
     <div class="section">
       <div class="section-title-row">
-        <span class="section-title">当前生效标签页</span>
-        <label class="lock-toggle" id="lockToggle" title="开启后锁定当前标签页,即使切换标签页也不影响;关闭该标签页自动解锁">
-          <span class="lock-toggle-label">锁定</span>
-          <span class="lock-switch"><span class="lock-knob"></span></span>
-        </label>
+        <span class="section-title">活跃会话</span>
+        <span class="count-badge" id="sessionCount">0</span>
       </div>
-      <div class="active-tab" id="activeTab">
-        <div class="tab-title" id="activeTabTitle">—</div>
-        <div class="tab-url" id="activeTabUrl">—</div>
-        <div class="tab-id" id="activeTabId"></div>
-        <div class="lock-badge" id="lockBadge" hidden>🔒 已锁定此标签页</div>
-      </div>
-    </div>
-
-    <!-- Tab List -->
-    <div class="section">
-      <div class="section-title-row">
-        <span class="section-title">全部标签页</span>
-        <span class="count-badge" id="tabCount">0</span>
-      </div>
-      <div class="tab-list" id="tabList"></div>
+      <div class="session-hint">近 90 秒内有操作的 agent 会话</div>
+      <div class="session-list" id="sessionList"></div>
     </div>
 
     <!-- Actions -->
     <div class="actions">
-      <button class="btn" id="copyBtn" title="复制当前 tab 信息（含 tabId）">复制当前 Tab</button>
-      <button class="btn primary" id="refreshBtn" title="刷新状态与标签页">刷新</button>
+      <button class="btn" id="copyBtn" title="复制当前活动 tab 信息（含 tabId）">复制当前 Tab</button>
+      <button class="btn primary" id="refreshBtn" title="刷新状态与会话">刷新</button>
     </div>
 
     <div class="footer">

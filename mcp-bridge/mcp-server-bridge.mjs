@@ -15,6 +15,43 @@ let isProxy = false;
 
 const WS_PORT = 48765;
 const HTTP_PORT = 48766;
+// ─── 会话标识与 client 识别(主/代理通用) ───
+// 每个 bridge 进程即一个 agent 会话。client 名的识别优先级:
+//   1) MCP 握手 clientInfo.name —— agent 在 initialize 时按协议自报,最权威(首次 callTool 时读取)
+//   2) 环境变量探测 —— 各 agent 拉起子进程时天然注入专属变量,作回退
+//   3) BRIDGE_CLIENT 环境变量 —— 用户显式指定,可强制覆盖上述
+//   4) 都拿不到 → 'unknown'
+// 把 MCP 上报的原始 name(如 claude-code / cursor-vscode)规范成展示名。
+function normalizeClientName(raw) {
+  if (!raw) return null;
+  const s = String(raw).toLowerCase();
+  if (s.includes('claude')) return 'Claude';
+  if (s.includes('codex')) return 'Codex';
+  if (s.includes('gemini')) return 'Gemini';
+  if (s.includes('cursor')) return 'Cursor';
+  if (s.includes('cline')) return 'Cline';
+  if (s.includes('windsurf')) return 'Windsurf';
+  // 未知但有名 → 原样展示(好过 unknown),但截断过长名避免撑爆面板
+  const name = String(raw).trim();
+  if (!name) return null;
+  return name.length > 14 ? name.slice(0, 13) + '…' : name;
+}
+function detectClientFromEnv() {
+  const e = process.env;
+  if (e.BRIDGE_CLIENT && e.BRIDGE_CLIENT.trim()) return e.BRIDGE_CLIENT.trim();
+  if (e.CLAUDECODE || e.CLAUDE_CODE_ENTRYPOINT || e.CLAUDE_CODE_SESSION_ID) return 'Claude';
+  if (e.CODEX_HOME || Object.keys(e).some(k => k.startsWith('CODEX_'))) return 'Codex';
+  if (e.GEMINI_CLI || e.GEMINI_API_KEY || Object.keys(e).some(k => k.startsWith('GEMINI_'))) return 'Gemini';
+  if (e.CURSOR_TRACE_ID || e.CURSOR_SESSION_ID) return 'Cursor';
+  return 'unknown';
+}
+const STARTED_AT = Date.now();
+const SESSION_ID = `${process.pid}-${STARTED_AT}`;
+const CLIENT_FORCED = (process.env.BRIDGE_CLIENT || '').trim(); // 用户显式覆盖(最高优先级)
+let BRIDGE_CLIENT = CLIENT_FORCED || detectClientFromEnv(); // 初值走环境;首次 callTool 会尝试用 clientInfo 升级
+const SESSION_STALE_MS = 25 * 1000; // 心跳容差:超过此时长无心跳/调用视为离线,从清单移除(=2.5个心跳周期)
+const HEARTBEAT_MS = 10 * 1000;     // PROXY 心跳间隔:定时上报在线
+const ACTIVE_MS = 90 * 1000;        // 活跃阈值:此时长内有真实工具调用→绿点,否则灰点(连着但空闲)
 // 代理实例(每个 agent 会话拉起的转发进程)空闲超时：无工具调用超过该时长则自动退出，
 // 避免会话不断开导致进程堆积。主实例(连浏览器 WS)不自动退，退出会断开浏览器连接。
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -37,6 +74,12 @@ function proxyHttpRequest(urlPath, method = 'GET', body = null) {
       path: urlPath,
       method,
       timeout: 120000,
+      headers: {
+        // 会话身份随每次转发上报,PRIMARY 据此维护活跃会话表(供面板展示)
+        'x-bridge-session': SESSION_ID,
+        'x-bridge-client': BRIDGE_CLIENT,
+        'x-bridge-started': String(STARTED_AT),
+      },
     };
     const req = http.request(options, (res) => {
       let data = '';
@@ -486,8 +529,46 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
   let pendingRequests = new Map();
   let currentId = 1;
 
+  // ─── 会话表:sessionId -> {client, pid, mode, startedAt, lastSeen, lastCallAt, calls} ───
+  // lastSeen=最近任意上报(含心跳)→ 判在线;lastCallAt=最近真实工具调用 → 判活跃(绿/灰)。
+  const sessions = new Map();
+  sessions.set(SESSION_ID, {
+    client: BRIDGE_CLIENT, pid: process.pid, mode: 'primary',
+    startedAt: STARTED_AT, lastSeen: Date.now(), lastCallAt: 0, calls: 0,
+  });
+  // 读请求 header 更新会话表。countCall=true 时累加调用次数并刷新 lastCallAt(仅业务路由;health/ping 不计)。
+  const touchSession = (req, countCall) => {
+    const sid = req.headers['x-bridge-session'];
+    if (!sid) return;
+    const now = Date.now();
+    // client 统一规范化(claude-code→Claude 等),避免主/代理显示不一致
+    const clientRaw = req.headers['x-bridge-client'];
+    const client = normalizeClientName(clientRaw); // 可能为 null(空串/无法识别)
+    const prev = sessions.get(sid);
+    if (prev) {
+      prev.lastSeen = now;
+      if (client) prev.client = client; // 仅在拿到有效名时覆盖,避免把已升级的名打回 unknown
+      if (countCall) { prev.calls++; prev.lastCallAt = now; }
+    } else {
+      // startedAt 合理性校验:非法/未来/超 30 天前一律回退 now,防面板显示错乱的接入时长
+      const raw = Number(req.headers['x-bridge-started']);
+      const startedAt = (Number.isFinite(raw) && raw <= now && raw >= now - 30 * 86400 * 1000) ? raw : now;
+      sessions.set(sid, {
+        client,
+        pid: Number(String(sid).split('-')[0]) || 0,
+        mode: 'proxy',
+        startedAt,
+        lastSeen: now,
+        lastCallAt: countCall ? now : 0,
+        calls: countCall ? 1 : 0,
+      });
+    }
+  };
+
   httpServer.on('request', (req, res) => {
     const url = req.url;
+    // 每个请求登记会话在线;/health(popup轮询)和 /session_ping(心跳)不算"调用"
+    touchSession(req, url !== '/health' && url !== '/session_ping');
 
     const handleBrowserAction = (action, extraPayload = {}) => {
       if (!activeClient || activeClient.readyState !== 1) {
@@ -508,12 +589,18 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
           res.end(JSON.stringify({ error: "Request timed out" }));
         }
       }, timeoutMs);
+      // __session 随 action 下发扩展,供扩展按会话维度绑定/解析目标 tab(每会话独立)
+      const sid = req.headers['x-bridge-session'] || SESSION_ID;
       pendingRequests.set(id, (response) => {
         clearTimeout(timer);
+        // 扩展回传本次实际操作的 tab → 更新会话表,面板显示真实 tab 而非笼统"活动标签页"
+        const rt = response && response.__resolvedTab;
+        const s = sessions.get(sid);
+        if (s && rt) { s.lastTabId = rt.tabId; s.lastTabTitle = rt.title || null; }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(response));
       });
-      activeClient.send(JSON.stringify({ action, id, ...extraPayload }));
+      activeClient.send(JSON.stringify({ action, id, __session: sid, ...extraPayload }));
     };
 
     const readBody = (cb) => {
@@ -526,7 +613,37 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       });
     };
 
+    if (url === "/session_ping") {
+      // PROXY 心跳:touchSession 已在入口刷新 lastSeen,这里直接回 200
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+
     if (url === "/health") {
+      // popup 探活/PROXY 探活都打这里。若带会话 header 则刷新其活跃(PRIMARY 自身也靠此保活)
+      const now = Date.now();
+      const self = sessions.get(SESSION_ID);
+      if (self) { self.lastSeen = now; self.client = BRIDGE_CLIENT; } // client 名可能被 callTool 用 clientInfo 升级过
+      // 回收僵尸会话:超期的非 primary 条目直接从 Map 删除(否则退出的进程/外部客户端会永久累积 → 内存泄漏)
+      for (const [sid, s] of sessions) {
+        if (s.mode !== 'primary' && now - s.lastSeen > SESSION_STALE_MS) sessions.delete(sid);
+      }
+      const onlineSessions = [...sessions.values()]
+        .filter(s => now - s.lastSeen <= SESSION_STALE_MS) // 心跳在→在线清单
+        .sort((a, b) => (b.lastCallAt || 0) - (a.lastCallAt || 0) || b.lastSeen - a.lastSeen)
+        .map(s => ({
+          client: s.client,
+          pid: s.pid,
+          mode: s.mode,
+          uptimeMs: now - s.startedAt,
+          idleMs: s.lastCallAt ? now - s.lastCallAt : null, // 距最近一次真实调用(null=从未调用)
+          active: !!(s.lastCallAt && now - s.lastCallAt <= ACTIVE_MS), // 绿点判据
+          calls: s.calls,
+          lastTool: s.lastTool || null,
+          lastTabId: s.lastTabId != null ? s.lastTabId : null,
+          lastTabTitle: s.lastTabTitle || null,
+        }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         service: "browser-link-tool", // 指纹:供探活确认对端确是本工具而非撞端口的陌生服务
@@ -534,7 +651,8 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
         mode: "primary",
         connected: !!(activeClient && activeClient.readyState === 1),
         wsPort: WS_PORT,
-        httpPort: HTTP_PORT
+        httpPort: HTTP_PORT,
+        sessions: onlineSessions,
       }));
       return;
     }
@@ -546,9 +664,19 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       return;
     }
 
+    // 记录该会话本次操作:工具名 + 目标 tab(供面板显示"谁在操作哪个 tab")
+    const recordOp = (data) => {
+      const sid = req.headers['x-bridge-session'];
+      const s = sid && sessions.get(sid);
+      if (!s) return;
+      s.lastTool = action;
+      // lastTabId/lastTabTitle 由扩展回传的 __resolvedTab 独家更新(真实操作的 tab,含活动 tab 场景)
+    };
+
     // GET 仅 /snapshot 兼容旧行为不再需要；统一按 POST 读 body
     if (req.method === "POST") {
       readBody((data) => {
+        recordOp(data);
         // eval 旧协议兼容：body 可能是纯代码字符串
         if (action === 'evaluate' && data.__raw != null) {
           handleBrowserAction('evaluate', { code: data.__raw });
@@ -557,6 +685,7 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
         handleBrowserAction(action, data);
       });
     } else {
+      recordOp({});
       handleBrowserAction(action, {});
     }
   });
@@ -632,6 +761,15 @@ async function callTool(request) {
   const args = request.params.arguments || {};
 
   bumpIdleTimer(); // 每次工具调用视为一次交互，重置空闲计时
+
+  // 用 MCP 握手上报的 clientInfo.name 升级 client 名(比环境变量探测权威)。
+  // 此时 initialize 早已完成,getClientVersion() 可用。用户显式 BRIDGE_CLIENT 不被覆盖。
+  if (!CLIENT_FORCED) {
+    try {
+      const fromMcp = normalizeClientName(server.getClientVersion()?.name);
+      if (fromMcp) BRIDGE_CLIENT = fromMcp;
+    } catch {}
+  }
 
   // 代理模式先探活:校验对端确是本工具主实例，再看浏览器是否在线
   if (isProxy) {
@@ -752,7 +890,18 @@ function bumpIdleTimer() {
 }
 bumpIdleTimer(); // 启动即开始计时；主实例中为 no-op
 
+// ─── PROXY 心跳:定时向 PRIMARY 上报"我还在线"(不计入调用次数)───
+// 让面板能显示"连着但空闲"的会话,而非只有正在调用的会话。主实例无需心跳(自刷)。
+let heartbeatTimer = null;
+if (isProxy) {
+  const beat = () => { proxyHttpRequest('/session_ping', 'GET').catch(() => {}); };
+  beat(); // 启动即上报一次
+  heartbeatTimer = setInterval(beat, HEARTBEAT_MS);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
+
 async function cleanup() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (primaryResources) {
     const { wss, wssHttpServer, httpServer, debounceTimer } = primaryResources;
     if (wss) { wss.clients.forEach(c => c.close()); wss.close(); }
