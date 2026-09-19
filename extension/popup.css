@@ -1,0 +1,133 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  width: 340px;
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+  background: #0f0f14;
+  color: #e4e4ed;
+  -webkit-font-smoothing: antialiased;
+}
+
+.popup-container {
+  padding: 16px;
+  background: linear-gradient(145deg, #16161e 0%, #0f0f14 100%);
+  border: 1px solid rgba(99, 102, 241, 0.12);
+  position: relative;
+  overflow: hidden;
+  animation: fadeIn 0.2s ease-out;
+}
+.popup-container::before {
+  content: '';
+  position: absolute;
+  top: -60%; left: -20%;
+  width: 140%; height: 120%;
+  background: radial-gradient(ellipse at 30% 20%, rgba(99, 102, 241, 0.08) 0%, transparent 60%);
+  pointer-events: none;
+}
+
+/* Header */
+.header { margin-bottom: 14px; position: relative; }
+.logo-row { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+.logo-icon { flex-shrink: 0; filter: drop-shadow(0 0 6px rgba(99, 102, 241, 0.4)); }
+.title {
+  font-size: 15px; font-weight: 700;
+  background: linear-gradient(135deg, #c7d2fe, #a78bfa);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  letter-spacing: 0.02em;
+}
+.subtitle { font-size: 11px; color: #6b6b80; margin-left: 28px; }
+
+/* Section */
+.section {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 10px;
+  position: relative;
+}
+.section-title { font-size: 11px; font-weight: 600; color: #8b8ba0; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+.section-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.section-title-row .section-title { margin-bottom: 0; }
+.count-badge {
+  font-size: 11px; font-weight: 700; color: #a78bfa;
+  background: rgba(167, 139, 250, 0.1);
+  padding: 1px 8px; border-radius: 10px;
+  border: 1px solid rgba(167, 139, 250, 0.2);
+}
+
+/* Status */
+.status-grid { display: flex; flex-direction: column; gap: 7px; }
+.status-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: #4a4a5e; flex-shrink: 0; box-shadow: 0 0 0 2px rgba(255,255,255,0.03); }
+.status-dot.on { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, 0.6); }
+.status-dot.off { background: #f87171; box-shadow: 0 0 6px rgba(248, 113, 113, 0.5); }
+.status-dot.idle { background: #6366f1; }
+.status-label { color: #a5a5ba; flex: 1; }
+.status-value { color: #e4e4ed; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+/* Active tab */
+.active-tab { line-height: 1.5; }
+.tab-title { font-size: 13px; font-weight: 600; color: #e4e4ed; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab-url { font-size: 11px; color: #6b6b80; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab-id { font-size: 10px; color: #a78bfa; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+/* Lock effective tab —— toggle 开关 */
+.lock-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  cursor: pointer; user-select: none;
+}
+.lock-toggle-label { font-size: 11px; color: #8b8ba0; transition: color 0.15s ease; }
+.lock-toggle.on .lock-toggle-label { color: #fbbf24; }
+.lock-switch {
+  position: relative; width: 30px; height: 16px; border-radius: 999px;
+  background: rgba(255,255,255,0.12); transition: background 0.18s ease; flex-shrink: 0;
+}
+.lock-toggle.on .lock-switch { background: rgba(251,191,36,0.55); }
+.lock-knob {
+  position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: #e4e4ed; transition: transform 0.18s ease;
+}
+.lock-toggle.on .lock-knob { transform: translateX(14px); background: #fff; }
+.lock-badge { font-size: 10px; color: #fbbf24; margin-top: 3px; font-weight: 500; }
+.tab-item.locked { background: rgba(251,191,36,0.1); border-color: rgba(251,191,36,0.35); }
+
+/* Tab list */
+.tab-list { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
+.tab-list::-webkit-scrollbar { width: 5px; }
+.tab-list::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 3px; }
+.tab-item {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 8px; border-radius: 7px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid transparent;
+  cursor: pointer; transition: all 0.15s ease;
+}
+.tab-item:hover { background: rgba(99,102,241,0.1); border-color: rgba(99,102,241,0.2); }
+.tab-item.active { background: rgba(167,139,250,0.12); border-color: rgba(167,139,250,0.3); }
+.tab-fav { width: 14px; height: 14px; flex-shrink: 0; border-radius: 2px; }
+.tab-fav-fallback { width: 14px; height: 14px; flex-shrink: 0; border-radius: 3px; background: rgba(99,102,241,0.3); }
+.tab-item-body { flex: 1; min-width: 0; }
+.tab-item-title { font-size: 12px; color: #d4d4e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab-item-meta { font-size: 10px; color: #5a5a70; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab-item-id { font-size: 10px; color: #7c7c95; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+
+/* Actions */
+.actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.btn {
+  flex: 1; padding: 8px; font-size: 12px; font-weight: 500;
+  color: #8b8ba0; background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;
+  cursor: pointer; transition: all 0.2s ease; font-family: inherit;
+}
+.btn:hover { color: #c7d2fe; background: rgba(99,102,241,0.1); border-color: rgba(99,102,241,0.25); }
+.btn:active { transform: scale(0.97); }
+.btn.primary { color: #c7d2fe; background: rgba(99,102,241,0.15); border-color: rgba(99,102,241,0.3); }
+.btn.primary:hover { background: rgba(99,102,241,0.25); }
+
+/* Footer */
+.footer { text-align: center; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.04); }
+.hint { font-size: 10px; color: #4a4a5e; transition: color 0.2s ease; }
+.hint.flash { color: #34d399; }
+
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }

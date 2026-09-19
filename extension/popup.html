@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Browser Link Tool</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <!-- Header -->
+    <div class="header">
+      <div class="logo-row">
+        <svg class="logo-icon" viewBox="0 0 24 24" width="20" height="20" fill="none">
+          <path d="M9 12a3 3 0 013-3h3a3 3 0 010 6h-3" stroke="url(#g1)" stroke-width="2" stroke-linecap="round"/>
+          <path d="M15 12a3 3 0 01-3 3H9a3 3 0 010-6h3" stroke="url(#g2)" stroke-width="2" stroke-linecap="round"/>
+          <defs>
+            <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient>
+            <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#818cf8"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+          </defs>
+        </svg>
+        <h1 class="title">Browser Link Tool</h1>
+      </div>
+      <p class="subtitle">浏览器 MCP 控制桥</p>
+    </div>
+
+    <!-- Connection Status -->
+    <div class="section">
+      <div class="section-title">连接状态</div>
+      <div class="status-grid">
+        <div class="status-row">
+          <span class="status-dot" id="bridgeDot"></span>
+          <span class="status-label">Bridge 服务</span>
+          <span class="status-value" id="bridgeValue">检测中…</span>
+        </div>
+        <div class="status-row">
+          <span class="status-dot" id="extDot"></span>
+          <span class="status-label">扩展连接</span>
+          <span class="status-value" id="extValue">检测中…</span>
+        </div>
+        <div class="status-row">
+          <span class="status-dot idle"></span>
+          <span class="status-label">运行模式</span>
+          <span class="status-value" id="modeValue">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Active Tab -->
+    <div class="section">
+      <div class="section-title-row">
+        <span class="section-title">当前生效标签页</span>
+        <label class="lock-toggle" id="lockToggle" title="开启后锁定当前标签页,即使切换标签页也不影响;关闭该标签页自动解锁">
+          <span class="lock-toggle-label">锁定</span>
+          <span class="lock-switch"><span class="lock-knob"></span></span>
+        </label>
+      </div>
+      <div class="active-tab" id="activeTab">
+        <div class="tab-title" id="activeTabTitle">—</div>
+        <div class="tab-url" id="activeTabUrl">—</div>
+        <div class="tab-id" id="activeTabId"></div>
+        <div class="lock-badge" id="lockBadge" hidden>🔒 已锁定此标签页</div>
+      </div>
+    </div>
+
+    <!-- Tab List -->
+    <div class="section">
+      <div class="section-title-row">
+        <span class="section-title">全部标签页</span>
+        <span class="count-badge" id="tabCount">0</span>
+      </div>
+      <div class="tab-list" id="tabList"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+      <button class="btn" id="copyBtn" title="复制当前 tab 信息（含 tabId）">复制当前 Tab</button>
+      <button class="btn primary" id="refreshBtn" title="刷新状态与标签页">刷新</button>
+    </div>
+
+    <div class="footer">
+      <span class="hint" id="toast">tabId 用于多会话精准定向操作</span>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

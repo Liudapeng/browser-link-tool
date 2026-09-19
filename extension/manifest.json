@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Link Tool",
+  "version": "1.0.0",
+  "description": "浏览器 MCP 控制桥：让 AI 助手远程操控任意网页（快照/点击/填充/导航/执行JS/长截图/等待/存储/Cookie）",
+  "permissions": ["storage", "activeTab", "tabs", "scripting", "alarms", "cookies", "debugger"],
+  "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Browser Link Tool - 浏览器 MCP 控制",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

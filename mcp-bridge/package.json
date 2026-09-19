@@ -1,0 +1,32 @@
+{
+  "name": "browser-link-tool",
+  "version": "1.1.0",
+  "description": "浏览器 MCP 控制桥 - 让 AI 助手远程操控浏览器网页,并在 Arthas Web 控制台诊断 Java 应用",
+  "main": "mcp-server-bridge.mjs",
+  "type": "module",
+  "bin": {
+    "browser-link-tool": "mcp-server-bridge.mjs"
+  },
+  "files": [
+    "mcp-server-bridge.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node mcp-server-bridge.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "browser",
+    "chrome-extension",
+    "automation",
+    "arthas"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "ws": "^8.20.0"
+  }
+}
