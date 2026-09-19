@@ -4,6 +4,8 @@
 
 这个 npm 包是其中的 **MCP Server(bridge)**。完整工具还需要一个配套的 **Chrome 扩展**(在浏览器里实际执行操作)——见下文。
 
+> 项目仓库:https://github.com/Liudapeng/browser-link-tool
+
 ## 能力
 
 - **通用网页操作**:读渲染后 HTML、CSS 选择器点击/填表、导航、执行 JS、截图、等元素、读写 localStorage / Cookie。
@@ -37,7 +39,7 @@
 
 ### 2. 加载 Chrome 扩展(必需)
 
-MCP Server 只是"AI 侧";实际操作浏览器要靠配套扩展。从项目仓库获取 `extension/` 目录 → 打开 `chrome://extensions` → 开发者模式 →「加载已解压的扩展程序」选该目录。**注意选 `extension/` 子目录,不是项目根目录**,否则找不到 `manifest.json` 会加载失败。点工具栏图标,面板显示「已连接」即就绪。
+MCP Server 只是"AI 侧";实际操作浏览器要靠配套扩展。从项目仓库 https://github.com/Liudapeng/browser-link-tool 获取 `extension/` 目录 → 打开 `chrome://extensions` → 开发者模式 →「加载已解压的扩展程序」选该目录。**注意选 `extension/` 子目录,不是项目根目录**,否则找不到 `manifest.json` 会加载失败。点工具栏图标,面板显示「已连接」即就绪。
 
 > 扩展与 bridge 通过本地 WebSocket(:48765)/ HTTP(:48766)通信,服务仅绑 `127.0.0.1`、全在本机、不出网。
 
