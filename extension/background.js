@@ -275,6 +275,7 @@ function connect() {
             // 该路径受页面 CSP 约束，仅适用于未禁 eval 的普通页面。
             const results = await chrome.scripting.executeScript({
               target: { tabId: tab.id },
+              world: 'MAIN', // 必须注入 MAIN world：页面的 Ext/框架/自定义全局变量都挂在 MAIN 的 window 上，ISOLATED world 是隔离副本读不到，会返回 undefined。
               func: async (codeStr) => {
                 // async + await：与 debugger 路径一致，支持用户代码写顶层 await。
                 try { return String(await (new Function('return (async()=>{' + codeStr + '})()'))()); }

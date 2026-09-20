@@ -129,7 +129,8 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 
 - **选择器先取证**：不要凭空猜 selector，先 `snapshot` 或 `evaluate` 查真实 DOM。
 - **fill 后需触发事件**：工具已自动派发 input/change；对 contenteditable（富文本）走 execCommand 模拟输入。
-- **evaluate 返回值**：会被 `String()` 序列化；要返回复杂对象请在 code 里自行 `JSON.stringify(...)`。
+- **evaluate 必须写 `return`**：code 被包进 IIFE，裸表达式（如 `document.title`）没有返回值 → 拿到 `undefined`；要值就写 `return document.title`。返回值会被 `String()` 序列化，复杂对象请自行 `JSON.stringify(...)`。
+- **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。若目标页**开着 F12**，debugger 被 DevTools 独占 → 自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查是否漏写 `return` 或该全局变量本就不存在，而非「桥不通」。
 - **截图**:`scrolling_screenshot` 截当前可视区一屏(不滚动拼接),返回 PNG 文件路径,随后可用 Read 查看。
 - **wait_for 超时**：默认 10s，慢页面显式加大 `timeout`。
 - **内部页不可操作**：`chrome://` / `edge://` / `about:` 无法 snapshot/注入。
