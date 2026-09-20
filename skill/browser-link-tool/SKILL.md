@@ -40,11 +40,12 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 
 ## 多会话定向（关键）
 
-除 `list_tabs` 外每个工具都支持可选 `tabId` 和 `url_match`：
+每个 agent 会话在 bridge 侧是独立会话,**自动绑定**它操作的标签页,多会话互不串扰:
 
-- **优先级**：`tabId` > `url_match`（URL 子串） > **锁定 tab** > 当前活动 tab。
-- **锁定 tab**：用户在面板点「锁定」把生效 tab 钉住,不带 `tabId`/`url_match` 的调用都作用于它、切换标签页不影响、关闭自动解锁。但你单次显式传 `tabId`/`url_match` 仍会覆盖锁定——**需严格作用于某 tab 时,优先显式带 `tabId`,别依赖用户是否锁定**。
-- **多会话并发**:各会话先 `list_tabs` 拿到自己的 `tabId`,后续都带上,即可互不干扰。
+- **自动绑定**:你(本会话)首次操作某 tab 后,bridge 记住它——之后不带 `tabId` 的调用都只作用于这个 tab,即使用户切到别的标签页、或别的 agent 会话在操作别的 tab,都不影响你。
+- **显式切换**:任何调用带 `tabId`(先 `list_tabs` 拿)或 `url_match`(URL 子串)即操作该 tab,并把本会话重新绑定到它。
+- **优先级**:显式 `tabId` / `url_match` > 本会话已绑定的 tab > 当前活动 tab(首次操作时用活动 tab 并绑定)。
+- **要严格作用于某 tab 时**:优先显式带 `tabId`,最稳妥;不带时依赖自动绑定,首次操作前请确认当前活动 tab 是你想要的。
 
 ## 标准操作范式
 
