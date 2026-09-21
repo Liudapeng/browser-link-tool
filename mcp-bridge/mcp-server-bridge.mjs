@@ -238,7 +238,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "mcp_browser_outline",
-    description: "返回页面【可交互元素精简清单】(按钮/链接/输入框/select/可点击项),每项含序号、类型 kind、可读文本 text、可直接用于 click/fill 的 selector、以及 hidden/disabled 状态。相比 snapshot 极大节省 context,是定位元素、确定选择器的首选。默认只列可见元素、最多 200 条。",
+    description: "返回页面【可交互元素精简清单】(按钮/链接/输入框/select/可点击项),纯文本每行一元素,格式 `[i] kind \"text\" [flags] @selector`——序号 i、类型 kind、可读文本 text、可选 [hidden]/[disabled] 标记、行尾 @ 后为可直接喂给 click/fill 的 selector。默认已过滤被 Modal/遮罩遮挡的底层元素(include_hidden=true 可保留)。相比 snapshot 极大节省 context,是定位元素、确定选择器的首选。默认只列可见元素、最多 200 条。",
     inputSchema: {
       type: "object",
       properties: {

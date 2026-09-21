@@ -153,20 +153,38 @@ function isInternalPage(url) {
   return url && (url.startsWith('chrome://') || url.startsWith('edge://') || url.startsWith('about:'));
 }
 
+// 判定用户代码是否含顶层 return（决定 debugger 路径用哪种包裹）。
+// 含 return → 语句块函数模式；否则 → 表达式模式（箭头函数体隐式返回，支持 await 表达式）。
+// 见 doc/plan_perception_and_accuracy_revamp.md 第 0 项。
+function needsFnWrap(code) {
+  const c = String(code || '').trim();
+  if (!c) return false;
+  return /(^|[^.\w])return[\s(;]/.test(c);
+}
+
 // 通过 DevTools 协议在页面上下文执行代码，不受页面 CSP（script-src 无 unsafe-eval）约束。
 // attach → Runtime.evaluate（returnByValue 拿可序列化结果）→ 无论成败都 detach，避免顶部调试黄条常驻。
+// 无状态三档（不用 replMode，避免其 let/const 声明持久化导致重复变量名报错）：
+//   1. 含顶层 return → `(async()=>{ code })()` 语句块函数模式；
+//   2. 否则先试 `(async()=>( code ))()` 箭头函数体表达式模式（拿完成值 + 支持 await 表达式）；
+//   3. 表达式模式语法失败（多语句/声明）→ 退回 `(async()=>{ code })()` 语句块模式（末表达式无 return 则得 undefined，最坏退化）。
 async function evaluateViaDebugger(tabId, code) {
   const target = { tabId };
+  const wrap = needsFnWrap(code);
+  const stmtExpr = '(async function(){' + code + '})()';   // 语句块模式（保留原始 code）
+  // 表达式模式：去掉尾部分号/空白，让 `document.title;` 这类带分号的单表达式也能走表达式模式（分号在括号内非法）。
+  const exprExpr = '(async()=>(' + String(code).replace(/[\s;]+$/, '') + '))()';
   await chrome.debugger.attach(target, '1.3');
+  const evalOnce = (expression) => chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+    expression, returnByValue: true, awaitPromise: true, userGesture: true
+  });
   try {
-    const res = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
-      // 包进 async IIFE：与降级路径语义一致（允许顶层 return / 多条语句），
-      // 且支持用户代码里写顶层 await（配合 awaitPromise:true 拿到 resolve 后的值）。
-      expression: '(async function(){' + code + '})()',
-      returnByValue: true,
-      awaitPromise: true,
-      userGesture: true
-    });
+    let res = await evalOnce(wrap ? stmtExpr : exprExpr);
+    // 表达式模式遇语法错误（多语句/顶层声明）→ 退回语句块模式重试，绝不因判定失误直接报错。
+    if (!wrap && res && res.exceptionDetails
+        && /SyntaxError/.test((res.exceptionDetails.exception && res.exceptionDetails.exception.description) || res.exceptionDetails.text || '')) {
+      res = await evalOnce(stmtExpr);
+    }
     if (res && res.exceptionDetails) {
       const ex = res.exceptionDetails;
       const desc = (ex.exception && (ex.exception.description || ex.exception.value)) || ex.text;
@@ -276,12 +294,18 @@ function connect() {
             const results = await chrome.scripting.executeScript({
               target: { tabId: tab.id },
               world: 'MAIN', // 必须注入 MAIN world：页面的 Ext/框架/自定义全局变量都挂在 MAIN 的 window 上，ISOLATED world 是隔离副本读不到，会返回 undefined。
-              func: async (codeStr) => {
-                // async + await：与 debugger 路径一致，支持用户代码写顶层 await。
-                try { return String(await (new Function('return (async()=>{' + codeStr + '})()'))()); }
-                catch (e) { return 'Error: ' + e.message; }
+              func: async (codeStr, wrap) => {
+                // wrap=true（含顶层 return）：async 函数包裹，与 debugger 路径一致。
+                // wrap=false：表达式模式——把整段作为 async 箭头函数体求值 `return (async()=>(表达式))()`，
+                //             既拿到表达式完成值、又支持 await 表达式；若 codeStr 是多语句/含声明会抛 SyntaxError，
+                //             catch 退回语句块函数模式（此时末表达式无 return 会得 undefined，属降级路径可接受的最坏退化）。
+                try {
+                  if (wrap) return String(await (new Function('return (async()=>{' + codeStr + '})()'))());
+                  try { return String(await (new Function('return (async()=>(' + codeStr.replace(/[\s;]+$/, '') + '))()'))()); }
+                  catch (_) { return String(await (new Function('return (async()=>{' + codeStr + '})()'))()); }
+                } catch (e) { return 'Error: ' + e.message; }
               },
-              args: [msg.code]
+              args: [msg.code, needsFnWrap(msg.code)]
             });
             const s = String(results[0] ? results[0].result : 'undefined');
             if (s.startsWith('Error: ')) send(msg.id, { error: s.slice(7) });
@@ -298,6 +322,10 @@ function connect() {
               try {
                 const el = document.querySelector(selector);
                 if (!el) return `Error: Element ${selector} not found`;
+                // disabled 判定：禁用元素直接明确报错，不再派发事件假装成功（把静默失败变成显式错误）。
+                if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') return 'Error: element is disabled';
+                // 就绪：滚入视口中央，确保元素可见且中心点坐标准确（对已在视口的元素是 no-op）。
+                try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (_) {}
                 // 派发完整鼠标序列，兼容仅监听 mousedown/mouseup 的元素（如 CodeMirror 工具条、ExtJS 按钮）。
                 // executeScript 为扩展特权注入，不受页面 CSP 限制，可安全构造并派发事件。
                 const r = el.getBoundingClientRect();
@@ -335,7 +363,13 @@ function connect() {
                   document.execCommand('insertText', false, val);
                   return 'success';
                 }
-                el.value = val;
+                // 原生原型 setter 穿透：React 16+/Vue 劫持了 el.value 的 setter，直接赋值会被框架回滚导致受控表单丢值。
+                // 用原生原型上的 setter 绕过框架劫持写入真实值，再派发冒泡的 input/change 让框架同步状态。
+                // 对普通(非受控)输入框，行为与直接赋值完全一致。
+                const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(el, val);
+                else el.value = val;
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
                 return 'success';
@@ -399,6 +433,18 @@ function connect() {
                 const cs = getComputedStyle(el);
                 return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
               };
+              // 遮挡过滤：元素中心点做命中测试，elementFromPoint 命中自身或自身后代才算「真正可点」，
+              // 借此排除被 Modal / 遮罩盖住的底层元素。中心点落在视口外时（长页面下方）无法命中测试，
+              // 保守判为不遮挡（保留），避免误杀视口外的合法元素。
+              const notOccluded = (el) => {
+                const r = el.getBoundingClientRect();
+                const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                if (cx < 0 || cy < 0 || cx > innerWidth || cy > innerHeight) return true;
+                const hit = document.elementFromPoint(cx, cy);
+                // 只认「命中自身」或「命中自身的后代」（如按钮内的 span）。
+                // 不能加 hit.contains(el)：命中「盖住 el 的祖先遮罩」时该判断为真会放行被遮挡元素，与过滤目标相悖。
+                return !!hit && (hit === el || el.contains(hit));
+              };
               // 为元素算一个尽量稳定、可直接喂给 click/fill 的 CSS 选择器：
               // id > [name] > [aria-label] > 唯一 class 组合 > :nth-of-type 兜底。
               const cssEscape = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
@@ -445,6 +491,8 @@ function connect() {
                 seen.add(el);
                 const vis = isVisible(el);
                 if (!vis && !includeHidden) continue;
+                // 遮挡过滤：默认档排除被弹层/遮罩盖住的元素；includeHidden 为逃生舱，跳过遮挡过滤。
+                if (!includeHidden && vis && !notOccluded(el)) continue;
                 const tag = el.tagName.toLowerCase();
                 const type = el.getAttribute('type');
                 const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
@@ -455,12 +503,22 @@ function connect() {
                   kind,
                   text: label(el),
                   selector: selectorFor(el),
-                  ...(vis ? {} : { hidden: true }),
-                  ...(disabled ? { disabled: true } : {})
+                  vis,
+                  disabled
                 });
                 if (out.length >= maxItems) break;
               }
-              return JSON.stringify({ count: out.length, truncated: out.length >= maxItems, elements: out });
+              // compact 纯文本输出：每行 `[i] kind "text" flags @selector`。
+              // 去掉 JSON 字段名冗余省 Token；selector 置于行尾 `@` 后，Agent 可直接截取喂 click/fill。
+              const truncated = out.length >= maxItems;
+              const lines = out.map((o) => {
+                const flags = (o.vis ? '' : ' [hidden]') + (o.disabled ? ' [disabled]' : '');
+                // text 压掉换行并把 " 换成 '，保证每元素恒为单行、Agent 可稳定按行尾 @ 截取 selector。
+                const t = o.text ? ' "' + o.text.replace(/[\r\n]+/g, ' ').replace(/"/g, "'") + '"' : '';
+                return '[' + o.i + '] ' + o.kind + t + flags + ' @' + o.selector;
+              });
+              const header = out.length + ' interactive element(s)' + (truncated ? ' (truncated at ' + maxItems + ')' : '');
+              return header + (lines.length ? '\n' + lines.join('\n') : '');
             },
             args: [{ includeHidden: msg.include_hidden === true, maxItems: msg.max_items || 200, scope: msg.scope || null }]
           });

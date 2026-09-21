@@ -59,9 +59,10 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 ## 选择器与元素定位策略
 
 - **别凭空猜 selector**：先 `outline`（首选，省 context）或 `snapshot` 拿到真实 DOM 再操作。`outline` 返回的 `selector` 可直接喂给 `click`/`fill`。
+- **outline 输出格式**：纯文本每行一元素 `[i] kind "text" [flags] @selector`，行尾 `@` 后即 selector（截取喂 `click`/`fill`）；默认已过滤被 Modal/遮罩遮挡的元素，需看被遮挡元素传 `include_hidden=true`。
 - **outline 的 selector 稳定性**：优先 `#id` > `[name]` > `[aria-label]` > `nth-of-type` 路径。带 id/name 的最稳；纯 `nth-of-type` 路径在动态列表里可能失效，操作前用 `wait_for`/`get_element` 复核。
 - **范围收窄**：页面元素多时给 `outline` 传 `scope`（如某弹窗/表单容器的选择器），只列该容器内的可交互元素，更省更准。
-- **点击前探测**：拿不准元素是否就绪时先 `get_element`（看 visible/disabled），再决定是否 `click`。
+- **点击前探测**：`click` 已内置——disabled/aria-disabled 元素直接返回 `Error: element is disabled`，视口外元素自动 `scrollIntoView` 滚入再点。拿不准是否就绪时仍可先 `get_element`（看 visible/disabled）复核。
 - **交互原子选型**：原生 `<select>` 用 `select_option`（别用 click 硬点选项）；回车提交/Tab 切换/Esc 关窗用 `press_key`；hover 才展开的菜单先 `hover` 再操作;懒加载列表先 `scroll_to`。
 
 ## 插件开发解析（dom_tree / inspect_element / pick_element / detect_env）
@@ -128,9 +129,9 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 ## 常见坑与约定
 
 - **选择器先取证**：不要凭空猜 selector，先 `snapshot` 或 `evaluate` 查真实 DOM。
-- **fill 后需触发事件**：工具已自动派发 input/change；对 contenteditable（富文本）走 execCommand 模拟输入。
-- **evaluate 必须写 `return`**：code 被包进 IIFE，裸表达式（如 `document.title`）没有返回值 → 拿到 `undefined`；要值就写 `return document.title`。返回值会被 `String()` 序列化，复杂对象请自行 `JSON.stringify(...)`。
-- **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。若目标页**开着 F12**，debugger 被 DevTools 独占 → 自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查是否漏写 `return` 或该全局变量本就不存在，而非「桥不通」。
+- **fill 后需触发事件**：工具已自动派发 input/change，并用原生原型 setter 穿透 React/Vue 受控组件劫持（受控表单填值不再被回滚）；对 contenteditable（富文本）走 execCommand 模拟输入。
+- **evaluate 无需写 `return`**：裸表达式（`document.title`）、多行以表达式结尾、顶层 `await`（`await fetch(u).then(r=>r.status)`）都能直接拿到值——内部自动判包裹。**唯一例外**：多语句且以表达式结尾又无 return（如 `let x=1; x+1`）会得 `undefined`，改写成 `let x=1; return x+1` 即可。返回值经 `String()` 序列化，复杂对象请自行 `JSON.stringify(...)`。
+- **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。若目标页**开着 F12**，debugger 被 DevTools 独占 → 自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查该全局变量是否本就不存在（而非「桥不通」）。
 - **截图**:`scrolling_screenshot` 截当前可视区一屏(不滚动拼接),返回 PNG 文件路径,随后可用 Read 查看。
 - **wait_for 超时**：默认 10s，慢页面显式加大 `timeout`。
 - **内部页不可操作**：`chrome://` / `edge://` / `about:` 无法 snapshot/注入。
