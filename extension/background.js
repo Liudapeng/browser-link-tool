@@ -153,6 +153,11 @@ function isInternalPage(url) {
   return url && (url.startsWith('chrome://') || url.startsWith('edge://') || url.startsWith('about:'));
 }
 
+// evaluate 结果为 undefined 时回传的提示串——undefined 常因代码以 el.click()/赋值/void 等
+// 「无返回值语句」结尾（JS 语义，非工具故障）。加提示引导 Agent，而非静默返回裸 'undefined' 被误判为工具坏。
+// 注意：只对 undefined 加，null（querySelector 未命中等）是真实答案，保持原样。
+const EVAL_UNDEF_HINT = 'undefined（无返回值——若代码以 el.click()/赋值/void 语句结尾属正常；要取值请在末尾加表达式，如 `foo(); document.title`）';
+
 // 判定用户代码是否含顶层 return（决定 debugger 路径用哪种包裹）。
 // 含 return → 语句块函数模式；否则 → 表达式模式（箭头函数体隐式返回，支持 await 表达式）。
 // 见 doc/plan_perception_and_accuracy_revamp.md 第 0 项。
@@ -191,8 +196,8 @@ async function evaluateViaDebugger(tabId, code) {
       return 'Error: ' + desc;
     }
     const r = res && res.result;
-    if (!r) return 'undefined';
-    if (r.type === 'undefined') return 'undefined';
+    if (!r) return EVAL_UNDEF_HINT;
+    if (r.type === 'undefined') return EVAL_UNDEF_HINT;
     if ('value' in r) return typeof r.value === 'object' ? JSON.stringify(r.value) : r.value;
     return r.description != null ? r.description : String(r.type);
   } finally {
@@ -294,18 +299,20 @@ function connect() {
             const results = await chrome.scripting.executeScript({
               target: { tabId: tab.id },
               world: 'MAIN', // 必须注入 MAIN world：页面的 Ext/框架/自定义全局变量都挂在 MAIN 的 window 上，ISOLATED world 是隔离副本读不到，会返回 undefined。
-              func: async (codeStr, wrap) => {
+              func: async (codeStr, wrap, undefHint) => {
                 // wrap=true（含顶层 return）：async 函数包裹，与 debugger 路径一致。
                 // wrap=false：表达式模式——把整段作为 async 箭头函数体求值 `return (async()=>(表达式))()`，
                 //             既拿到表达式完成值、又支持 await 表达式；若 codeStr 是多语句/含声明会抛 SyntaxError，
                 //             catch 退回语句块函数模式（此时末表达式无 return 会得 undefined，属降级路径可接受的最坏退化）。
+                // undefined 结果回传提示串（与 debugger 路径一致），null 保持原样。
+                const ser = (v) => (v === undefined ? undefHint : (typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)));
                 try {
-                  if (wrap) return String(await (new Function('return (async()=>{' + codeStr + '})()'))());
-                  try { return String(await (new Function('return (async()=>(' + codeStr.replace(/[\s;]+$/, '') + '))()'))()); }
-                  catch (_) { return String(await (new Function('return (async()=>{' + codeStr + '})()'))()); }
+                  if (wrap) return ser(await (new Function('return (async()=>{' + codeStr + '})()'))());
+                  try { return ser(await (new Function('return (async()=>(' + codeStr.replace(/[\s;]+$/, '') + '))()'))()); }
+                  catch (_) { return ser(await (new Function('return (async()=>{' + codeStr + '})()'))()); }
                 } catch (e) { return 'Error: ' + e.message; }
               },
-              args: [msg.code, needsFnWrap(msg.code)]
+              args: [msg.code, needsFnWrap(msg.code), EVAL_UNDEF_HINT]
             });
             const s = String(results[0] ? results[0].result : 'undefined');
             if (s.startsWith('Error: ')) send(msg.id, { error: s.slice(7) });
