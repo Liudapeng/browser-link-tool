@@ -131,8 +131,15 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 - **选择器先取证**：不要凭空猜 selector，先 `snapshot` 或 `evaluate` 查真实 DOM。
 - **fill 后需触发事件**：工具已自动派发 input/change，并用原生原型 setter 穿透 React/Vue 受控组件劫持（受控表单填值不再被回滚）；对 contenteditable（富文本）走 execCommand 模拟输入。
 - **evaluate 无需写 `return`**：裸表达式（`document.title`）、多行以表达式结尾、顶层 `await`（`await fetch(u).then(r=>r.status)`）都能直接拿到值——内部自动判包裹。**唯一例外**：多语句且以表达式结尾又无 return（如 `let x=1; x+1`）会得 `undefined`，改写成 `let x=1; return x+1` 即可。返回值经 `String()` 序列化，复杂对象请自行 `JSON.stringify(...)`。
+- **拿到 `undefined` 不等于工具坏了**：`el.click()`/`el.dispatchEvent(...)`/赋值语句这类**本身就返回 undefined** 的代码，返回 undefined 是 JS 语义，与工具无关（换 `JSON.stringify` 包也没用）。要结果就在末尾追加取值表达式，如 `el.click(); document.querySelector('.modal') ? 'opened' : 'none'`；要看副作用（弹层是否出现等）用 `get_element`/`outline`/`scrolling_screenshot` 观测，别指望 click 的返回值。
 - **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。若目标页**开着 F12**，debugger 被 DevTools 独占 → 自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查该全局变量是否本就不存在（而非「桥不通」）。
 - **截图**:`scrolling_screenshot` 截当前可视区一屏(不滚动拼接),返回 PNG 文件路径,随后可用 Read 查看。
 - **wait_for 超时**：默认 10s，慢页面显式加大 `timeout`。
 - **内部页不可操作**：`chrome://` / `edge://` / `about:` 无法 snapshot/注入。
-- **未连接报错**：若返回「No Chrome Extension connected」，提示用户检查扩展面板是否「已连接」、bridge 是否运行。
+- **未连接报错**：若返回「No Chrome Extension connected」，说明 bridge 活着但浏览器扩展没连上——提示用户检查扩展面板是否「已连接」、bridge 是否运行（**这类不要自己重启 bridge**，是扩展侧的事）。
+- **`Transport closed` / MCP 连接断——自愈,别干等用户**：这是本会话的 MCP stdio 传输断了（常见于 bridge 进程被重启/杀掉后没自动拉起）。按以下流程自起一条**专属** bridge 恢复，无需用户操作：
+  1. 启动独立进程 `node <本工具目录>/mcp-bridge/mcp-server-bridge.mjs`（路径见 MCP 配置里的 args）。
+  2. 走完 MCP 握手：`initialize` → `notifications/initialized` → `tools/list`。
+  3. 之后经这条 stdio 连接正常 `tools/call` 调 `mcp_browser_*`。
+  - **为什么安全**：bridge 是「主实例 + 代理」架构——已有主实例（连着浏览器 WS）时，你新起的进程会自动进入 **PROXY 模式**转发，不抢端口、空闲自退、不影响别人。
+  - **🚨 红线**：只能起**你自己的**独立 bridge；**严禁 `pkill`/重启/杀掉其他 agent 会话的 bridge 进程**（会导致别的会话 `Transport closed`）。主实例进程尤其不能杀（它一退，浏览器连接就断）。
