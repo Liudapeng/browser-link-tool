@@ -7,7 +7,7 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 
 用 `mcp_browser_*` 系列工具操控真实浏览器。前提：Browser Link Tool 扩展已加载且面板显示「已连接」，bridge 已注册为 MCP Server（见插件目录 `install.sh`）。
 
-> **🗣️ 每次调用前先报一句意图（强制）**：调任何 `mcp_browser_*` 前，用一句中文说明「这步干啥、为什么」，让用户看得懂执行链路。尤其 `evaluate`——把要跑的脚本目的讲清（如「读表头字段，确认列名再拼汇总 SQL」），别让用户只看到孤零零的 `OUT undefined` 猜不出在做什么。一句话即可，别长篇。
+> **🗣️ 每次调用前先报一句意图（强制）**：调任何 `mcp_browser_*` 前，用一句中文说明「这步干啥、为什么」，让用户看得懂执行链路。尤其 `evaluate`——把要跑的脚本目的讲清（如「读表头字段，确认列名再拼汇总 SQL」），别让用户只看到孤零零的 `OUT undefined` 猜不出在做什么。一句话即可，别长篇；关键节点也可用 `scrolling_screenshot` 让用户直观看到页面状态。
 
 ## 工具清单
 
