@@ -91,22 +91,10 @@ EOF
   fi
 fi
 
-# ── 4. 安装 Skill（Claude Code 必装；codex 若存在也装)─────────
-SKILL_SRC="$SCRIPT_DIR/skill/$MCP_NAME/SKILL.md"
-if [ -f "$SKILL_SRC" ]; then
-  install_skill() {  # $1 = skills 根目录
-    local dst="$1/$MCP_NAME"
-    mkdir -p "$dst"
-    cp "$SKILL_SRC" "$dst/SKILL.md"
-    echo "   ✔ Skill 已安装到 $dst"
-  }
+# ── 4. 安装 Skill（Claude Code / Codex / Gemini，各家 skills 目录存在才铺）──
+if [ -x "$SCRIPT_DIR/sync-skills-local.sh" ]; then
   echo "==> 安装 Skill…"
-  install_skill "$HOME/.claude/skills"
-  # codex 存在则也装一份(其 skills 目录约定为 ~/.codex/skills)
-  if command -v codex >/dev/null 2>&1; then
-    install_skill "$HOME/.codex/skills"
-    echo "   ℹ codex skill 目录约定视版本而定，若你的 codex 不认此目录可忽略（MCP 工具不受影响）"
-  fi
+  "$SCRIPT_DIR/sync-skills-local.sh" || true
 fi
 
 # ── 5. 加载扩展指引 ───────────────────────────────────────
