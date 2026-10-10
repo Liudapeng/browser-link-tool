@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 把 SKILL.md 同步到本机各客户端的 skills 目录(Claude Code / Codex / Gemini)。
-# 三份是独立副本(非软链),故需主动铺设。仅铺已存在对应客户端配置根目录的那几家。
+# 把 SKILL.md 同步到本机各客户端的 skills 目录(Claude Code / Codex / Gemini / Cursor / JoyCode)。
+# 多份是独立副本(非软链),故需主动铺设。仅铺已存在对应客户端配置根目录的那几家。
 # 由 post-commit hook 在 SKILL.md 变更时调用,也可手动执行。
 
 set -euo pipefail
@@ -23,3 +23,5 @@ install_one() {  # $1 = 客户端配置根(如 ~/.claude);仅当该根已存在�
 install_one "$HOME/.claude" "Claude Code"
 install_one "$HOME/.codex"  "Codex"
 install_one "$HOME/.gemini" "Gemini"
+install_one "$HOME/.cursor" "Cursor"
+install_one "$HOME/.joycode" "JoyCode"

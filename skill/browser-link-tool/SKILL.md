@@ -1,6 +1,6 @@
 ---
 name: browser-link-tool
-description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/按键/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「在指定标签页执行」「多个会话分别控制不同 tab」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或提到 mcp_browser_* 工具时使用。
+description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/按键/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、让浏览器带登录态下载 URL 到磁盘并返回真实绝对路径、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「下载页面/接口数据到本地/把大数据落盘交脚本处理」「在指定标签页执行」「多个会话分别控制不同 tab」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或提到 mcp_browser_* 工具时使用。
 ---
 
 # Browser Link Tool — 浏览器 MCP 操控
@@ -38,6 +38,7 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 | `mcp_browser_set_storage` | `storageType?`,`key`,`value` | 写 storage |
 | `mcp_browser_get_cookies` | `url?`,`name?` | 读 Cookie |
 | `mcp_browser_set_cookies` | `url?`,`name`,`value`,… | 写 Cookie |
+| `mcp_browser_download_url` | `url`(或`dataUrl`),`filename?`,`timeoutMs?` | 浏览器带登录态下载 URL 并等写盘完成，返回文件磁盘真实绝对路径（跨 Chromium 浏览器通用，把大数据经磁盘交本地脚本、不进模型） |
 | `mcp_browser_arthas_exec` | `command`,`timeout?`,`idle_ms?`,`read_only?`,`interrupt?`,`snapshot?`,`render_wait?`,`auto_snapshot_ms?` | 在 Arthas Web 控制台投递命令并采集输出 |
 
 ## 多会话定向（关键）
