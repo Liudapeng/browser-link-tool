@@ -209,6 +209,7 @@ Chrome 扩展无法经 npm 分发,须从仓库获取 `extension/` 目录手动�
 | `mcp_browser_wait_for` | 等待元素出现(可选可见性 / 文本) |
 | `mcp_browser_get_storage` / `set_storage` | 读写 localStorage / sessionStorage |
 | `mcp_browser_get_cookies` / `set_cookies` | 读写 Cookie |
+| `mcp_browser_download_url` | 发起下载并等写盘完成，返回文件磁盘真实绝对路径（跨 Chromium 浏览器通用，用于把大数据经磁盘交本地脚本） |
 | `mcp_browser_arthas_exec` | 在 Arthas Web 控制台投递命令并采集执行结果 |
 
 除 `list_tabs` 外,所有工具均支持可选 `tabId` / `url_match` 定向目标标签页。

@@ -218,6 +218,20 @@ const TOOL_DEFINITIONS = [
     }
   },
   {
+    name: "mcp_browser_download_url",
+    description: "在目标 tab 内发起一次下载并等待写盘完成，返回文件在磁盘上的真实绝对路径（跨任意 Chromium 内核浏览器通用，无需猜下载目录）。两种用法：① 传 url —— 让浏览器直接下载该 URL（带页面登录态）；② 传 dataUrl —— 下载一段已拼好的内容（如页面内 fetch 得到的 JSON，先在 evaluate 里转成 data: URL）。可选 filename 指定保存文件名（仅文件名，落浏览器默认下载目录）。用于把大体量数据经磁盘交给本地脚本处理而不进模型。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "要下载的 URL（http(s) 或 data: 均可）；与 dataUrl 二选一" },
+        dataUrl: { type: "string", description: "可选，data: URL 形式的内容（与 url 二选一，等价写法）" },
+        filename: { type: "string", description: "可选，保存的文件名（仅文件名，不含目录；缺省由浏览器定）" },
+        timeoutMs: { type: "number", description: "可选，等待下载完成的超时毫秒数，默认 60000" },
+        ...TAB_TARGET_PROPS
+      }
+    }
+  },
+  {
     name: "mcp_browser_set_cookies",
     description: "为指定 URL（默认当前 tab）设置一个 Cookie。",
     inputSchema: {
@@ -278,11 +292,11 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "mcp_browser_press_key",
-    description: "向元素(或当前焦点元素)派发一次按键事件(keydown/keypress/keyup)。用于回车提交、Tab 切换、Esc 关弹窗、方向键等。selector 缺省则作用于 document.activeElement。",
+    description: "按键:优先走 CDP 真实键盘输入(能真正录入字符、触发浏览器默认行为如 Tab 真实移焦),DevTools 占用等情况自动降级为合成事件。用于回车提交、Tab 切换、Esc 关弹窗、方向键、逐字符输入触发联想。selector 缺省则作用于 document.activeElement。",
     inputSchema: {
       type: "object",
       properties: {
-        key: { type: "string", description: "键名:Enter/Tab/Escape/Backspace/Delete/Space/ArrowUp/ArrowDown/ArrowLeft/ArrowRight 或单个字符" },
+        key: { type: "string", description: "键名:Enter/Tab/Escape/Backspace/Delete/Space/ArrowUp/ArrowDown/ArrowLeft/ArrowRight/Home/End/PageUp/PageDown 或单个字符" },
         selector: { type: "string", description: "可选,目标元素 CSS 选择器;缺省作用于当前焦点元素" },
         ...TAB_TARGET_PROPS
       },
@@ -291,7 +305,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "mcp_browser_hover",
-    description: "把鼠标悬停到某元素上(派发 pointerover/mouseover/mouseenter/mousemove)。用于触发 hover 才展开的下拉菜单、tooltip、悬浮操作按钮。",
+    description: "把鼠标悬停到某元素上(派发 pointerover/mouseover/mouseenter/mousemove)。用于触发 hover 才展开的下拉菜单、tooltip、悬浮操作按钮。注意:只触发 JS 监听,不触发 CSS :hover 伪类——纯 CSS 实现的菜单(.menu:hover>.panel)展不开,此类菜单请改用 evaluate 直接改样式或读取隐藏节点。",
     inputSchema: {
       type: "object",
       properties: { selector: { type: "string", description: "目标元素 CSS 选择器" }, ...TAB_TARGET_PROPS },
@@ -417,6 +431,7 @@ const TOOL_ROUTES = {
   mcp_browser_get_storage: { path: '/get_storage', method: 'POST', bodyFn: (a) => JSON.stringify({ storageType: a.storageType, key: a.key, ...pickTabTargets(a) }) },
   mcp_browser_set_storage: { path: '/set_storage', method: 'POST', bodyFn: (a) => JSON.stringify({ storageType: a.storageType, key: a.key, value: a.value, ...pickTabTargets(a) }) },
   mcp_browser_get_cookies: { path: '/get_cookies', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url, name: a.name, ...pickTabTargets(a) }) },
+  mcp_browser_download_url: { path: '/download', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url || a.dataUrl, filename: a.filename, timeoutMs: a.timeoutMs, ...pickTabTargets(a) }) },
   mcp_browser_set_cookies: { path: '/set_cookies', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url, name: a.name, value: a.value, path: a.path, domain: a.domain, secure: a.secure, httpOnly: a.httpOnly, expirationDate: a.expirationDate, ...pickTabTargets(a) }) },
   mcp_browser_outline: { path: '/outline', method: 'POST', bodyFn: (a) => JSON.stringify({ scope: a.scope, include_hidden: a.include_hidden, max_items: a.max_items, ...pickTabTargets(a) }) },
   mcp_browser_get_element: { path: '/get_element', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, attr: a.attr, ...pickTabTargets(a) }) },
@@ -459,6 +474,7 @@ const HTTP_ACTION_MAP = {
   '/get_storage': 'get_storage',
   '/set_storage': 'set_storage',
   '/get_cookies': 'get_cookies',
+  '/download': 'download',
   '/set_cookies': 'set_cookies',
   '/arthas_exec': 'arthas_exec',
   '/get_current_tab': 'get_current_tab',
@@ -581,6 +597,7 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       if (action === 'scrolling_screenshot') timeoutMs = 120000;
       else if (action === 'wait_for') timeoutMs = 65000;
       else if (action === 'arthas_exec') timeoutMs = Math.max((extraPayload.timeout || 60000) + 5000, 65000);
+      else if (action === 'download') timeoutMs = Math.max((extraPayload.timeoutMs || 60000) + 5000, 65000);
       else timeoutMs = 15000;
       const timer = setTimeout(() => {
         if (pendingRequests.has(id)) {

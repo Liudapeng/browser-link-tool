@@ -167,6 +167,157 @@ function needsFnWrap(code) {
   return /(^|[^.\w])return[\s(;]/.test(c);
 }
 
+/* ========== CDP 真实输入通道（press_key / hover 用） ==========
+ * 为何需要：合成 DOM 事件（dispatchEvent）有两条无法绕过的硬伤——
+ *   1. 不触发 CSS :hover 伪类 → 纯 CSS 实现的下拉菜单/tooltip 永远展不开；
+ *   2. KeyboardEvent 不产生字符、不触发浏览器默认行为（Tab 移焦、字符录入、IME）。
+ * CDP Input.dispatch* 由浏览器输入管线处理，上述两项均原生生效（isTrusted=true）。
+ *
+ * 设计原则（防负升级）：CDP 仅作为「优先路径」，任何失败都静默退回原合成事件实现，
+ * 保证改造后的最坏表现 == 改造前表现，绝不把「能用」变成「报错」。
+ * 已知 CDP 不可用场景（均需降级）：用户开着 DevTools 占用调试端口、chrome:// 内部页、
+ * 扩展商店页、attach 权限被拒。
+ */
+
+// attach 会话复用：hover/press_key 需连发多条 Input 命令，逐条 attach/detach 会让顶部
+// 调试黄条反复闪烁。故一次操作内复用同一会话，并在空闲后延迟 detach——既不闪也不常驻。
+const CDP_IDLE_DETACH_MS = 1500;
+const cdpSessions = new Map();   // tabId -> { refs:number, timer:number|null }
+
+async function cdpAcquire(tabId) {
+  const s = cdpSessions.get(tabId);
+  if (s) {
+    // 已有会话：取消待执行的 detach，引用计数 +1
+    if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+    s.refs++;
+    return true;
+  }
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+  } catch (e) {
+    // 已被别的客户端（DevTools / 其他扩展）attach 时，Chrome 报 "Another debugger
+    // is already attached"。此时无法复用也无法抢占，直接判定 CDP 不可用 → 调用方降级。
+    return false;
+  }
+  cdpSessions.set(tabId, { refs: 1, timer: null });
+  return true;
+}
+
+function cdpRelease(tabId) {
+  const s = cdpSessions.get(tabId);
+  if (!s) return;
+  s.refs--;
+  if (s.refs > 0) return;
+  // 空闲后延迟 detach：若紧接着还有 CDP 操作（agent 常连续 hover→press_key），可直接复用会话。
+  s.timer = setTimeout(async () => {
+    cdpSessions.delete(tabId);
+    try { await chrome.debugger.detach({ tabId }); } catch (e) {}
+  }, CDP_IDLE_DETACH_MS);
+}
+
+// tab 关闭/导航后残留会话会让后续 attach 失败，这里主动清理登记。
+chrome.debugger.onDetach && chrome.debugger.onDetach.addListener((source) => {
+  if (!source || source.tabId == null) return;
+  const s = cdpSessions.get(source.tabId);
+  if (s && s.timer) clearTimeout(s.timer);
+  cdpSessions.delete(source.tabId);
+});
+
+function cdpSend(tabId, method, params) {
+  return chrome.debugger.sendCommand({ tabId }, method, params || {});
+}
+
+/* 为何 hover 不走 CDP（实测结论，勿再尝试）：
+ * CDP Input.dispatchMouseEvent(mouseMoved) 能触发 CSS :hover 伪类，但有两重硬约束叠加，
+ * 导致在「浏览器不在前台也要工作」这一核心场景下实际可用性为零：
+ *   1. Chrome 窗口无焦点时渲染引擎不更新 :hover 视觉态（判据 document.hasFocus()===false）；
+ *      而 macOS 下 chrome.windows.update({focused:true}) 与 CDP Page.bringToFront 都无法
+ *      把 Chrome 从后台应用拉到前台（跨应用抢焦点是 OS 级限制）。
+ *   2. 即便窗口在前台、CDP 投递当场生效（实测读到 display:block），hover 态也会被
+ *      **真实鼠标物理位置**覆盖，跨 MCP 调用不保持（实测 :hover 链回到物理鼠标所在元素）。
+ * 而 hover 的全部用途是「展开菜单 → 下一次调用读/点菜单项」，恰好要求跨调用保持。
+ * 故 hover 保持合成事件实现：能触发 JS 监听的菜单，纯 CSS :hover 菜单无解（原本即如此）。
+ */
+
+// 键名 → CDP 参数表。CDP 需要 windowsVirtualKeyCode 才能触发浏览器默认行为（Tab 移焦等）。
+const CDP_KEYS = {
+  Enter:      { key: 'Enter',      code: 'Enter',      vk: 13, text: '\r' },
+  Tab:        { key: 'Tab',        code: 'Tab',        vk: 9 },
+  Escape:     { key: 'Escape',     code: 'Escape',     vk: 27 },
+  Backspace:  { key: 'Backspace',  code: 'Backspace',  vk: 8 },
+  Delete:     { key: 'Delete',     code: 'Delete',     vk: 46 },
+  Space:      { key: ' ',          code: 'Space',      vk: 32, text: ' ' },
+  ' ':        { key: ' ',          code: 'Space',      vk: 32, text: ' ' },
+  ArrowUp:    { key: 'ArrowUp',    code: 'ArrowUp',    vk: 38 },
+  ArrowDown:  { key: 'ArrowDown',  code: 'ArrowDown',  vk: 40 },
+  ArrowLeft:  { key: 'ArrowLeft',  code: 'ArrowLeft',  vk: 37 },
+  ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', vk: 39 },
+  Home:       { key: 'Home',       code: 'Home',       vk: 36 },
+  End:        { key: 'End',        code: 'End',        vk: 35 },
+  PageUp:     { key: 'PageUp',     code: 'PageUp',     vk: 33 },
+  PageDown:   { key: 'PageDown',   code: 'PageDown',   vk: 34 }
+};
+
+function cdpKeyDescriptor(key) {
+  const named = CDP_KEYS[key];
+  if (named) return named;
+  // 单个可打印字符：text 字段让浏览器真正录入字符（合成事件做不到这点）
+  if (typeof key === 'string' && Array.from(key).length === 1) {
+    const ch = key;
+    const upper = ch.toUpperCase();
+    let code;
+    if (/^[a-zA-Z]$/.test(ch)) code = 'Key' + upper;
+    else if (/^[0-9]$/.test(ch)) code = 'Digit' + ch;
+    else code = '';
+    // 字母键的虚拟键码按大写字母的 ASCII 取值
+    const vk = /^[a-zA-Z0-9]$/.test(ch) ? upper.charCodeAt(0) : 0;
+    return { key: ch, code, vk, text: ch };
+  }
+  return null;
+}
+
+// CDP 按键：产生真实字符输入 + 触发浏览器默认行为（Tab 移焦、Enter 提交等）。
+// selector 为空时作用于当前焦点元素（与原实现语义一致）。
+async function pressKeyViaCDP(tabId, selector, key) {
+  const desc = cdpKeyDescriptor(key);
+  if (!desc) return { ok: false, reason: 'unsupported_key' };
+  // 指定了 selector：先聚焦目标（CDP 按键作用于焦点元素，不接受 selector）
+  if (selector) {
+    const focused = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return 'notfound';
+        try { el.focus(); } catch (_) {}
+        return document.activeElement === el ? 'ok' : 'notfocusable';
+      },
+      args: [selector]
+    });
+    const fr = focused[0].result;
+    if (fr === 'notfound') return { ok: false, reason: 'notfound' };
+    // notfocusable（如 div 无 tabindex）仍继续：事件会落到 document/body，与原实现行为接近
+  }
+  if (!(await cdpAcquire(tabId))) return { ok: false, reason: 'attach_failed' };
+  try {
+    const common = {
+      key: desc.key,
+      code: desc.code || undefined,
+      windowsVirtualKeyCode: desc.vk || undefined,
+      nativeVirtualKeyCode: desc.vk || undefined
+    };
+    // 有 text 的键用 keyDown（带 text 才录入字符）；纯控制键用 rawKeyDown（避免插入控制符）
+    await cdpSend(tabId, 'Input.dispatchKeyEvent', desc.text
+      ? { type: 'keyDown', text: desc.text, unmodifiedText: desc.text, ...common }
+      : { type: 'rawKeyDown', ...common });
+    await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: 'cdp_error: ' + (e && e.message) };
+  } finally {
+    cdpRelease(tabId);
+  }
+}
+
 // 通过 DevTools 协议在页面上下文执行代码，不受页面 CSP（script-src 无 unsafe-eval）约束。
 // attach → Runtime.evaluate（returnByValue 拿可序列化结果）→ 无论成败都 detach，避免顶部调试黄条常驻。
 // 无状态三档（不用 replMode，避免其 let/const 声明持久化导致重复变量名报错）：
@@ -179,7 +330,10 @@ async function evaluateViaDebugger(tabId, code) {
   const stmtExpr = '(async function(){' + code + '})()';   // 语句块模式（保留原始 code）
   // 表达式模式：去掉尾部分号/空白，让 `document.title;` 这类带分号的单表达式也能走表达式模式（分号在括号内非法）。
   const exprExpr = '(async()=>(' + String(code).replace(/[\s;]+$/, '') + '))()';
-  await chrome.debugger.attach(target, '1.3');
+  // 走统一会话管理（cdpAcquire/cdpRelease），不再自行 attach/detach：
+  // hover/press_key 的 CDP 会话有 1.5s 空闲延迟期，期间若此处独立 attach 会因
+  // "Another debugger is already attached" 失败。复用引用计数可避免该撞车。
+  if (!(await cdpAcquire(tabId))) throw new Error('debugger attach failed');
   const evalOnce = (expression) => chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
     expression, returnByValue: true, awaitPromise: true, userGesture: true
   });
@@ -201,7 +355,7 @@ async function evaluateViaDebugger(tabId, code) {
     if ('value' in r) return typeof r.value === 'object' ? JSON.stringify(r.value) : r.value;
     return r.description != null ? r.description : String(r.type);
   } finally {
-    try { await chrome.debugger.detach(target); } catch (e) {}
+    cdpRelease(tabId);
   }
 }
 
@@ -595,6 +749,13 @@ function connect() {
 
         case 'press_key': {
           const tab = await resolveTab(msg);
+          // 优先 CDP 真实按键：产生真实字符（'a'→录入 "a"）、触发浏览器默认行为（Tab 真实移焦）。
+          // 合成 KeyboardEvent 两者都做不到，只能让页面的 keydown 监听器收到事件。
+          const viaCdp = await pressKeyViaCDP(tab.id, msg.selector || null, msg.key);
+          if (viaCdp.ok) { send(msg.id, { result: 'success' }); return; }
+          // 元素找不到是确定性错误，不必降级重试
+          if (viaCdp.reason === 'notfound') { send(msg.id, { result: `Error: Element ${msg.selector} not found` }); return; }
+          // 其余原因（DevTools 占用 / 未支持键名 / CDP 报错）→ 降级到合成事件，保证不比改造前差
           const results = await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             func: (selector, key) => {
@@ -628,6 +789,7 @@ function connect() {
 
         case 'hover': {
           const tab = await resolveTab(msg);
+          // 保持合成事件实现（不走 CDP，原因见上文 hover 不走 CDP 的实测结论）。
           const results = await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             func: (selector) => {
@@ -1044,6 +1206,52 @@ function connect() {
             name: c.name, value: c.value, domain: c.domain, path: c.path,
             secure: c.secure, httpOnly: c.httpOnly, expirationDate: c.expirationDate
           }))) });
+          return;
+        }
+
+        case 'download': {
+          await resolveTab(msg);                               // 校验 tab 存在（下载本身由浏览器会话发起，带登录态）
+          if (!msg.url) { send(msg.id, { error: '缺少 url/dataUrl' }); return; }
+          const opts = { url: msg.url, conflictAction: 'uniquify', saveAs: false };
+          if (msg.filename) opts.filename = msg.filename;      // 仅文件名，落浏览器默认下载目录
+          const downloadId = await chrome.downloads.download(opts);
+          const waitMs = msg.timeoutMs || 60000;
+          // 下载写盘是异步的：等 state=complete 再 search 取磁盘绝对路径（跨任意 Chromium 浏览器通用）
+          const path = await new Promise((resolve, reject) => {
+            let settled = false;                               // 守卫：监听/超时/兜底之间防重复完成与竞态误报
+            const finish = (fn, err) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              chrome.downloads.onChanged.removeListener(onChanged);
+              err ? reject(err) : resolve(fn);
+            };
+            const timer = setTimeout(() => finish(null, new Error('下载超时未完成')), waitMs);
+            // 按 downloadItem 的终态落定：complete→查磁盘路径；interrupted→报中断原因
+            const settleByItem = (it) => {
+              if (!it) return false;
+              if (it.state === 'complete') { finish(it.filename); return true; }
+              if (it.state === 'interrupted') {
+                finish(null, new Error('下载被中断: ' + (it.error || '未知'))); return true;
+              }
+              return false;
+            };
+            const onChanged = async (delta) => {
+              if (delta.id !== downloadId || settled) return;
+              if (!(delta.state && (delta.state.current === 'complete' || delta.state.current === 'interrupted'))) return;
+              try {
+                const [it] = await chrome.downloads.search({ id: downloadId });
+                if (settled) return;                           // await 期间可能已超时落定，避免覆盖
+                if (!settleByItem(it)) finish(null, new Error('下载完成但查不到文件记录'));
+              } catch (e) { finish(null, e); }
+            };
+            chrome.downloads.onChanged.addListener(onChanged);
+            // 兜底：极快下载可能在挂监听前就已到终态（complete 或 interrupted 都要处理）
+            chrome.downloads.search({ id: downloadId })
+              .then(([it]) => { if (!settled) settleByItem(it); })
+              .catch(() => {});                                // 兜底查询失败交给监听/超时，不产生未处理拒绝
+          });
+          send(msg.id, { result: JSON.stringify({ path, downloadId }) });
           return;
         }
 
