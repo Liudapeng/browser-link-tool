@@ -1,6 +1,6 @@
 ---
 name: browser-link-tool
-description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/按键/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、让浏览器带登录态下载 URL 到磁盘并返回真实绝对路径、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「下载页面/接口数据到本地/把大数据落盘交脚本处理」「在指定标签页执行」「多个会话分别控制不同 tab」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或提到 mcp_browser_* 工具时使用。
+description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/真实键盘输入/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、让浏览器带登录态下载 URL 到磁盘并返回真实绝对路径、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。还可用于**前端开发自测闭环**：改完代码后在用户当前已打开的 localhost 标签页里触发交互、读控制台报错、抓接口请求、截图确认渲染，自测通过再交卷（登录态与弹窗层级完整保留，HMR 原地取证）。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc/逐字符输入」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「下载页面/接口数据到本地/把大数据落盘交脚本处理」「在指定标签页执行」「多个会话分别控制不同 tab」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或**在本地开发前端页面时要求「改完测一下交互/看看有没有报错/截图确认效果/自测后再交付」**，或提到 mcp_browser_* 工具时使用。
 ---
 
 # Browser Link Tool — 浏览器 MCP 操控
@@ -26,8 +26,8 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 | `mcp_browser_click` | `selector` | 点击元素 |
 | `mcp_browser_fill` | `selector`,`value` | 填充输入框/contenteditable |
 | `mcp_browser_select_option` | `selector`,`value`,`by_label?` | 选原生 `<select>` 下拉项 |
-| `mcp_browser_press_key` | `key`,`selector?` | 派发按键(Enter/Tab/Esc/方向键等) |
-| `mcp_browser_hover` | `selector` | 悬停触发下拉菜单/tooltip |
+| `mcp_browser_press_key` | `key`,`selector?` | 真实键盘输入(Enter/Tab/Esc/方向键/单字符),能录入字符与触发默认行为 |
+| `mcp_browser_hover` | `selector` | 悬停(仅触发 JS 监听,**不触发 CSS `:hover`**) |
 | `mcp_browser_scroll_to` | `selector` | 滚动元素到视口中央 |
 | `mcp_browser_navigate` | `url` | 跳转 |
 | `mcp_browser_wait_for` | `selector`,`text?`,`visible?`,`timeout?` | 等待元素出现 |
@@ -66,7 +66,10 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 - **outline 的 selector 稳定性**：优先 `#id` > `[name]` > `[aria-label]` > `nth-of-type` 路径。带 id/name 的最稳；纯 `nth-of-type` 路径在动态列表里可能失效，操作前用 `wait_for`/`get_element` 复核。
 - **范围收窄**：页面元素多时给 `outline` 传 `scope`（如某弹窗/表单容器的选择器），只列该容器内的可交互元素，更省更准。
 - **点击前探测**：`click` 已内置——disabled/aria-disabled 元素直接返回 `Error: element is disabled`，视口外元素自动 `scrollIntoView` 滚入再点。拿不准是否就绪时仍可先 `get_element`（看 visible/disabled）复核。
-- **交互原子选型**：原生 `<select>` 用 `select_option`（别用 click 硬点选项）；回车提交/Tab 切换/Esc 关窗用 `press_key`；hover 才展开的菜单先 `hover` 再操作;懒加载列表先 `scroll_to`。
+- **交互原子选型**：原生 `<select>` 用 `select_option`（别用 click 硬点选项）；回车提交/Tab 切换/Esc 关窗/逐字符输入用 `press_key`；懒加载列表先 `scroll_to`。
+- **`press_key` 走真实键盘输入（CDP）**：区别于合成事件，它能**真正录入字符**（逐字符按键可触发搜索联想/输入校验）并**触发浏览器默认行为**（`Tab` 真实移焦、`Enter` 提交）。传单个字符即输入该字符（如 `key:"a"`）；`selector` 缺省作用于当前焦点元素。与 DevTools(F12) 可共存。不可用时自动降级为合成事件，最坏表现与降级前一致。
+- **`hover` 不触发 CSS `:hover` 伪类** ⚠️：它只派发 `mouseover/mouseenter/mousemove`，能触发 **JS 监听**的菜单，但对纯 CSS 实现的菜单（`.menu:hover > .panel { display:block }`）**完全无效**。这是浏览器层面的限制，非工具缺陷——窗口无焦点时渲染引擎不更新 `:hover` 态，且该态会被真实鼠标物理位置覆盖、跨调用不保持，故无法用 CDP 绕过。
+  - **纯 CSS 菜单的正确做法**：用 `evaluate` 直接读隐藏节点内容（`document.querySelector('.panel').innerHTML`），或临时改样式使其可见后再操作；也可 `outline({scope:"<面板选择器>"}) `+ `include_hidden:true` 拿隐藏项的 selector 直接 `click`。
 
 ## 插件开发解析（dom_tree / inspect_element / pick_element / detect_env）
 
@@ -86,6 +89,23 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 - `get_network` 默认只给 method/url/status/耗时；要看响应体传 `with_body:true`（截前 1000 字符）。
 - `clear:true` 读完清空，便于下一轮只看增量。
 - 局限：`navigate`/刷新会重建页面、钩子丢失，需重新装；跨页面持续追踪不适用。
+
+## 前端开发自测闭环（改完代码别直接交卷）
+
+当用户正在本地开发前端页面（`localhost:*` / Vite / Next.js / webpack-dev-server），且本工具可用时：**改完代码后主动在浏览器里自测，确认无报错、渲染正确再交付**，不要盲写就交卷。
+
+操作的是用户**当前已打开**的标签页，登录态、已点开的弹窗层级、Redux/Pinia 里的 Mock 数据全部保留——不需要（也不应该）重走登录与前置操作。改完代码后 HMR 会原地热更新，直接取证即可。
+
+标准闭环：
+
+1. **先装钩子**：`get_console`（首调仅装钩子，见上节时序）；需看接口再 `get_network`。
+2. **触发交互**：`outline` 拿 selector → `fill` / `click` / `press_key` 走一遍目标路径；异步的用 `wait_for` 等关键元素。
+3. **读报错**：再调 `get_console` —— 重点看 `Uncaught TypeError`、React Hydration mismatch、缺 `key` 警告、Vue 的 patch 报错。
+4. **验接口**（涉及提交/保存时）：`get_network({with_body:true})` 看请求体参数对不对、响应是否 4xx/5xx —— 可直接区分「前端传参错」还是「接口契约不一致」。
+5. **验渲染**：`get_element` 查校验文案/状态类名是否如期出现；样式/布局类改动用 `scrolling_screenshot` 截图**亲眼确认**（是否对齐、有无溢出撑破滚动条）。
+6. 有问题则回到第 2 步重跑，全绿后再向用户交付并说明已自测通过。
+
+注意：热更新有延迟，改完代码后先 `wait_for` 关键元素或短暂等待再取证，避免读到旧渲染结果。
 
 ## Arthas Web 控制台操控（mcp_browser_arthas_exec）
 
@@ -135,7 +155,7 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 - **fill 后需触发事件**：工具已自动派发 input/change，并用原生原型 setter 穿透 React/Vue 受控组件劫持（受控表单填值不再被回滚）；对 contenteditable（富文本）走 execCommand 模拟输入。
 - **evaluate 无需写 `return`**：裸表达式（`document.title`）、多行以表达式结尾、顶层 `await`（`await fetch(u).then(r=>r.status)`）都能直接拿到值——内部自动判包裹。**唯一例外**：多语句且以表达式结尾又无 return（如 `let x=1; x+1`）会得 `undefined`，改写成 `let x=1; return x+1` 即可。返回值经 `String()` 序列化，复杂对象请自行 `JSON.stringify(...)`。
 - **拿到 `undefined` 不等于工具坏了**：`el.click()`/`el.dispatchEvent(...)`/赋值语句这类**本身就返回 undefined** 的代码，返回 undefined 是 JS 语义，与工具无关（换 `JSON.stringify` 包也没用）。要结果就在末尾追加取值表达式，如 `el.click(); document.querySelector('.modal') ? 'opened' : 'none'`；要看副作用（弹层是否出现等）用 `get_element`/`outline`/`scrolling_screenshot` 观测，别指望 click 的返回值。
-- **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。若目标页**开着 F12**，debugger 被 DevTools 独占 → 自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查该全局变量是否本就不存在（而非「桥不通」）。
+- **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。**开着 F12 也能用**——扩展的 `chrome.debugger` 与 DevTools 可共存（已实测 `evaluate`/`press_key` 在 F12 开启时均正常）；仅在 attach 真失败时才自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查该全局变量是否本就不存在（而非「桥不通」）。
 - **截图**:`scrolling_screenshot` 截当前可视区一屏(不滚动拼接),返回 PNG 文件路径,随后可用 Read 查看。
 - **wait_for 超时**：默认 10s，慢页面显式加大 `timeout`。
 - **内部页不可操作**：`chrome://` / `edge://` / `about:` 无法 snapshot/注入。
