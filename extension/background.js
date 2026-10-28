@@ -116,11 +116,12 @@ async function resolveTabInner(msg) {
     } catch (e) { /* fall through */ }
     throw new Error(`Tab ${msg.tabId} not found`);
   }
-  if (msg && msg.urlMatch) {
+  if (msg && msg.urlMatch != null || msg && msg.url_match != null) {
+    const targetUrl = msg.urlMatch != null ? msg.urlMatch : msg.url_match;
     const tabs = await chrome.tabs.query({});
-    const hit = tabs.find(t => t.url && t.url.includes(msg.urlMatch));
+    const hit = tabs.find(t => t.url && t.url.includes(targetUrl));
     if (hit) { await setBinding(sid, hit.id); return hit; }
-    throw new Error(`No tab matching url "${msg.urlMatch}"`);
+    throw new Error(`No tab matching url "${targetUrl}"`);
   }
   // 无显式目标:优先该会话已绑定的 tab(每会话独立)
   const boundId = await getBinding(sid);
@@ -360,12 +361,63 @@ async function evaluateViaDebugger(tabId, code) {
 }
 
 function send(id, payload) {
+  // 取出并清理本次实际操作的 tab(即便 socket 断开也必须清理，防 Map 泄漏)
+  const rt = id != null ? resolvedTabByMsgId.get(id) : null;
+  if (id != null && rt) resolvedTabByMsgId.delete(id);
   if (socket && socket.readyState === WebSocket.OPEN) {
-    // 附带本次实际操作的 tab(供 bridge 面板显示"谁在操作哪个 tab"),随后清理
-    const rt = resolvedTabByMsgId.get(id);
-    if (rt) resolvedTabByMsgId.delete(id);
     socket.send(JSON.stringify({ id, ...payload, __resolvedTab: rt || null }));
   }
+}
+
+// 统一将脚本返回的 'Error: xxx' 字符串转为 { error: 'xxx' }，使 MCP 层正确标记 isError:true，
+// 同时保持返回给 Agent 的文本仍为 "Error: xxx"（与改造前零差异、防负升级）。
+function sendResult(id, val) {
+  if (typeof val === 'string' && val.startsWith('Error: ')) {
+    send(id, { error: val.slice(7) });
+  } else {
+    send(id, { result: val });
+  }
+}
+
+// 浏览器带登录态下载 URL/dataUrl 并等待落盘，返回 { path, downloadId }
+async function downloadUrlToDisk(url, filename, timeoutMs) {
+  const opts = { url, conflictAction: 'uniquify', saveAs: false };
+  if (filename) opts.filename = filename; // 仅文件名，落浏览器默认下载目录
+  const downloadId = await chrome.downloads.download(opts);
+  const waitMs = timeoutMs || 60000;
+  const path = await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      err ? reject(err) : resolve(fn);
+    };
+    const timer = setTimeout(() => finish(null, new Error('下载超时未完成')), waitMs);
+    const settleByItem = (it) => {
+      if (!it) return false;
+      if (it.state === 'complete') { finish(it.filename); return true; }
+      if (it.state === 'interrupted') {
+        finish(null, new Error('下载被中断: ' + (it.error || '未知'))); return true;
+      }
+      return false;
+    };
+    const onChanged = async (delta) => {
+      if (delta.id !== downloadId || settled) return;
+      if (!(delta.state && (delta.state.current === 'complete' || delta.state.current === 'interrupted'))) return;
+      try {
+        const [it] = await chrome.downloads.search({ id: downloadId });
+        if (settled) return;
+        if (!settleByItem(it)) finish(null, new Error('下载完成但查不到文件记录'));
+      } catch (e) { finish(null, e); }
+    };
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.search({ id: downloadId })
+      .then(([it]) => { if (!settled) settleByItem(it); })
+      .catch(() => {});
+  });
+  return { path, downloadId };
 }
 
 function connect() {
@@ -505,7 +557,7 @@ function connect() {
             },
             args: [msg.selector]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -538,7 +590,7 @@ function connect() {
             },
             args: [msg.selector, msg.value]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -683,7 +735,7 @@ function connect() {
             },
             args: [{ includeHidden: msg.include_hidden === true, maxItems: msg.max_items || 200, scope: msg.scope || null }]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -716,7 +768,7 @@ function connect() {
             },
             args: [msg.selector, msg.attr || null]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -743,7 +795,7 @@ function connect() {
             },
             args: [msg.selector, msg.value, msg.by_label === true]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -754,7 +806,7 @@ function connect() {
           const viaCdp = await pressKeyViaCDP(tab.id, msg.selector || null, msg.key);
           if (viaCdp.ok) { send(msg.id, { result: 'success' }); return; }
           // 元素找不到是确定性错误，不必降级重试
-          if (viaCdp.reason === 'notfound') { send(msg.id, { result: `Error: Element ${msg.selector} not found` }); return; }
+          if (viaCdp.reason === 'notfound') { sendResult(msg.id, `Error: Element ${msg.selector} not found`); return; }
           // 其余原因（DevTools 占用 / 未支持键名 / CDP 报错）→ 降级到合成事件，保证不比改造前差
           const results = await chrome.scripting.executeScript({
             target: { tabId: tab.id },
@@ -783,7 +835,7 @@ function connect() {
             },
             args: [msg.selector || null, msg.key]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -807,7 +859,7 @@ function connect() {
             },
             args: [msg.selector]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -825,7 +877,7 @@ function connect() {
             },
             args: [msg.selector]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -891,7 +943,7 @@ function connect() {
             },
             args: [msg.selector || null, msg.x != null ? msg.x : null, msg.y != null ? msg.y : null]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -997,7 +1049,7 @@ function connect() {
             },
             args: [{ scope: msg.scope || null, maxDepth: msg.max_depth || 8, maxNodes: msg.max_nodes || 300, includeText: msg.include_text === true }]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -1057,45 +1109,100 @@ function connect() {
               } catch (e) { return 'Error: ' + e.message; }
             }
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
         case 'get_network': {
           const tab = await resolveTab(msg);
-          // 注入式捕获：劫持 fetch + XHR，记录 method/url/status/耗时（可选响应体片段）。
-          // 首次调用装 hook 返回 installed:true，之后读缓存。避免 debugger 黄条 + SW 休眠丢数据。
+          // 注入式捕获：劫持 fetch + XHR，记录 method/url/status/耗时，并底层缓存非二进制 body 与 headers。
+          // 首次调用装 hook 返回 installed:true，之后读缓存并按当次调用的 withBody/withHeaders/maxBody 动态裁剪返回。
           // 必须注入 MAIN world：页面的 fetch/XHR 都在 MAIN，ISOLATED world 的 window 是另一个对象、劫持不到。
           const results = await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             world: 'MAIN',
-            func: (clear, max, withBody) => {
+            func: (clear, max, withBody, withHeaders, maxBody) => {
               const KEY = '__blt_net_buf__';
+              const CFG_KEY = '__blt_net_cfg__';
+              const bodyLimit = (typeof maxBody === 'number' && maxBody > 0) ? maxBody : 1000;
+              if (!window[CFG_KEY]) window[CFG_KEY] = { maxCap: 16384 };
+              if (bodyLimit > window[CFG_KEY].maxCap) window[CFG_KEY].maxCap = Math.min(bodyLimit, 131072);
+
               if (!window[KEY]) {
                 const buf = [];
                 window[KEY] = buf;
                 const cap = 300;
                 const rec = (e) => { buf.push(e); if (buf.length > cap) buf.shift(); };
-                const clip = (s) => { try { return String(s).slice(0, 1000); } catch (_) { return ''; } };
+                const clipRaw = (s) => {
+                  try { return String(s).slice(0, window[CFG_KEY].maxCap || 16384); } catch (_) { return ''; }
+                };
+                const isBinaryCt = (ct) => /^(image|audio|video|font|application\/(octet-stream|zip|pdf|wasm))/i.test(String(ct || '').trim());
+                // headers 规整成普通对象（Headers 实例 / 数组 / 对象 都支持）
+                const toObj = (h) => {
+                  if (!h) return undefined;
+                  try {
+                    if (typeof h.forEach === 'function' && !Array.isArray(h)) { const o = {}; h.forEach((v, k) => { o[k] = v; }); return o; }
+                    if (Array.isArray(h)) { const o = {}; for (const [k, v] of h) o[k] = v; return o; }
+                    if (typeof h === 'object') return { ...h };
+                  } catch (_) {}
+                  return undefined;
+                };
                 const origFetch = window.fetch;
                 window.fetch = function (...a) {
                   const t0 = Date.now();
                   const url = (a[0] && a[0].url) || a[0];
-                  const method = (a[1] && a[1].method) || 'GET';
-                  return origFetch.apply(this, a).then(async (res) => {
+                  const method = (a[1] && a[1].method) || (a[0] && a[0].method) || 'GET';
+                  let reqHeaders;
+                  try { reqHeaders = toObj((a[1] && a[1].headers) || (a[0] && a[0].headers)); } catch (_) {}
+                  return origFetch.apply(this, a).then((res) => {
                     const e = { type: 'fetch', method, url: String(url).slice(0, 300), status: res.status, ms: Date.now() - t0, t: t0 };
-                    if (withBody) { try { e.body = clip(await res.clone().text()); } catch (_) {} }
-                    rec(e); return res;
-                  }).catch(err => { rec({ type: 'fetch', method, url: String(url).slice(0, 300), status: 0, error: String(err), ms: Date.now() - t0, t: t0 }); throw err; });
+                    if (reqHeaders) e._reqHeaders = reqHeaders;
+                    try { e._resHeaders = toObj(res.headers); } catch (_) {}
+                    try {
+                      const ct = res.headers && typeof res.headers.get === 'function' ? res.headers.get('content-type') : '';
+                      if (!isBinaryCt(ct)) {
+                        // 异步读取 clone，绝不阻塞页面自身 fetch 的 Promise resolve
+                        res.clone().text().then(txt => { e._body = clipRaw(txt); }).catch(() => {});
+                      }
+                    } catch (_) {}
+                    rec(e);
+                    return res;
+                  }).catch(err => {
+                    const e = { type: 'fetch', method, url: String(url).slice(0, 300), status: 0, error: String(err), ms: Date.now() - t0, t: t0 };
+                    if (reqHeaders) e._reqHeaders = reqHeaders;
+                    rec(e);
+                    throw err;
+                  });
                 };
                 const OrigXHR = window.XMLHttpRequest;
                 const origOpen = OrigXHR.prototype.open;
                 const origSend = OrigXHR.prototype.send;
-                OrigXHR.prototype.open = function (m, u) { this.__blt = { method: m, url: String(u).slice(0, 300), t0: Date.now() }; return origOpen.apply(this, arguments); };
+                const origSetHdr = OrigXHR.prototype.setRequestHeader;
+                OrigXHR.prototype.open = function (m, u) {
+                  this.__blt = { method: m, url: String(u).slice(0, 300), t0: Date.now(), reqHeaders: {} };
+                  return origOpen.apply(this, arguments);
+                };
+                OrigXHR.prototype.setRequestHeader = function (k, v) {
+                  try { if (this.__blt) this.__blt.reqHeaders[k] = v; } catch (_) {}
+                  return origSetHdr.apply(this, arguments);
+                };
                 OrigXHR.prototype.send = function () {
                   if (this.__blt) this.addEventListener('loadend', () => {
                     const e = { type: 'xhr', method: this.__blt.method, url: this.__blt.url, status: this.status, ms: Date.now() - this.__blt.t0, t: this.__blt.t0 };
-                    if (withBody) { try { e.body = clip(this.responseText); } catch (_) {} }
+                    try {
+                      if (!this.responseType || this.responseType === 'text') e._body = clipRaw(this.responseText);
+                      else if (this.responseType === 'json' && this.response != null) e._body = clipRaw(JSON.stringify(this.response));
+                    } catch (_) {}
+                    try { e._reqHeaders = this.__blt.reqHeaders; } catch (_) {}
+                    try {
+                      const raw = this.getAllResponseHeaders() || '';
+                      const o = {};
+                      raw.trim().split(/[\r\n]+/).forEach(line => {
+                        const i = line.indexOf(':');
+                        if (i > 0) o[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+                      });
+                      e._resHeaders = o;
+                    } catch (_) {}
                     rec(e);
                   });
                   return origSend.apply(this, arguments);
@@ -1103,13 +1210,225 @@ function connect() {
                 return JSON.stringify({ installed: true, requests: [] });
               }
               const buf = window[KEY];
-              const reqs = buf.slice(-max);
+              const rawReqs = buf.slice(-max);
               if (clear) buf.length = 0;
+              const reqs = rawReqs.map(r => {
+                const out = { type: r.type, method: r.method, url: r.url, status: r.status, ms: r.ms, t: r.t };
+                if (r.error) out.error = r.error;
+                if (withBody && r._body != null) out.body = String(r._body).slice(0, bodyLimit);
+                if (withHeaders) {
+                  if (r._reqHeaders) out.reqHeaders = r._reqHeaders;
+                  if (r._resHeaders) out.resHeaders = r._resHeaders;
+                }
+                return out;
+              });
               return JSON.stringify({ installed: false, count: reqs.length, requests: reqs });
             },
-            args: [msg.clear === true, msg.max_items || 50, msg.with_body === true]
+            args: [msg.clear === true, msg.max_items || 50, msg.with_body === true, msg.with_headers === true, (typeof msg.max_body === 'number' ? msg.max_body : 0)]
           });
           send(msg.id, { result: results[0].result });
+          return;
+        }
+
+        case 'js_grep': {
+          const tab = await resolveTab(msg);
+          const pattern = msg.pattern != null ? String(msg.pattern) : '';
+          const wantDownload = msg.download === true;
+          if (!pattern && !(wantDownload && msg.sources)) {
+            send(msg.id, { error: '缺少 pattern 参数（仅当 download=true 且指定 sources 时可省略 pattern）' });
+            return;
+          }
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',
+            func: async (opts) => {
+              const { pattern, isRegex, ctxLen, maxHits, sourcesFilter, wantDownload } = opts;
+              let re = null;
+              if (pattern && isRegex) {
+                try { re = new RegExp(pattern, 'g'); }
+                catch (e) { return { error: '无效正则表达式: ' + e.message }; }
+              }
+              // 收集外部脚本 URL（script 标签 + performance resource）与内联脚本
+              const extUrls = [];
+              const seen = new Set();
+              const addUrl = (u) => {
+                if (!u || seen.has(u)) return;
+                if (sourcesFilter && !u.includes(sourcesFilter)) return;
+                seen.add(u);
+                extUrls.push(u);
+              };
+              Array.from(document.scripts).forEach(s => { if (s.src) addUrl(s.src); });
+              try {
+                performance.getEntriesByType('resource').forEach(r => {
+                  if (r && r.name && (r.initiatorType === 'script' || /\.m?js(\?|$|#)/i.test(r.name))) addUrl(r.name);
+                });
+              } catch (_) {}
+
+              const inlines = [];
+              Array.from(document.scripts).forEach((s, idx) => {
+                if (!s.src && s.textContent && s.textContent.trim()) {
+                  const label = `<inline#${idx}>`;
+                  if (!sourcesFilter || label.includes(sourcesFilter)) {
+                    inlines.push({ source: label, text: s.textContent, inline: true });
+                  }
+                }
+              });
+
+              // 若不传 pattern、仅按 sources 下载外部脚本，直接返回待下载清单
+              if (!pattern && wantDownload) {
+                return {
+                  scannedScripts: extUrls.length + inlines.length,
+                  matchedScripts: extUrls.length + inlines.length,
+                  totalHits: 0,
+                  truncated: false,
+                  hits: [],
+                  toDownload: [
+                    ...extUrls.map(u => ({ source: u, url: u })),
+                    ...inlines.map((it, i) => ({
+                      source: it.source,
+                      url: 'data:text/javascript;charset=utf-8,' + encodeURIComponent(it.text),
+                      defaultName: `inline-${i}.js`
+                    }))
+                  ]
+                };
+              }
+
+              const hits = [];
+              const matchedMap = new Map(); // source -> { source, url, defaultName }
+              const skipped = [];
+              let scanned = 0;
+              let truncated = false;
+              const deadline = Date.now() + 45000;
+
+              // 计算字符偏移对应的 1-based 行号与列号
+              const buildLineStarts = (text) => {
+                const starts = [0];
+                for (let i = 0; i < text.length; i++) {
+                  if (text.charCodeAt(i) === 10) starts.push(i + 1);
+                }
+                return starts;
+              };
+              const locate = (starts, idx) => {
+                let lo = 0, hi = starts.length - 1;
+                while (lo <= hi) {
+                  const mid = (lo + hi) >>> 1;
+                  if (starts[mid] <= idx) lo = mid + 1;
+                  else hi = mid - 1;
+                }
+                return { line: hi + 1, column: idx - starts[hi] + 1 };
+              };
+
+              const searchInText = (source, text, dlInfo) => {
+                if (!text) return;
+                scanned++;
+                let starts = null;
+                const recordHit = (idx, matchStr) => {
+                  if (!matchedMap.has(source) && dlInfo) matchedMap.set(source, dlInfo);
+                  if (hits.length >= maxHits) { truncated = true; return false; }
+                  if (!starts) starts = buildLineStarts(text);
+                  const pos = locate(starts, idx);
+                  const s = Math.max(0, idx - ctxLen);
+                  const e = Math.min(text.length, idx + matchStr.length + ctxLen);
+                  hits.push({
+                    source,
+                    line: pos.line,
+                    column: pos.column,
+                    match: matchStr.slice(0, 120),
+                    snippet: text.slice(s, e)
+                  });
+                  return hits.length < maxHits || wantDownload;
+                };
+
+                if (re) {
+                  re.lastIndex = 0;
+                  let m;
+                  while ((m = re.exec(text)) !== null) {
+                    const keepGoing = recordHit(m.index, m[0]);
+                    if (m[0].length === 0) re.lastIndex++;
+                    if (!keepGoing) break;
+                  }
+                } else {
+                  let pos = 0;
+                  while (pos <= text.length) {
+                    const idx = text.indexOf(pattern, pos);
+                    if (idx === -1) break;
+                    const keepGoing = recordHit(idx, pattern);
+                    pos = idx + Math.max(1, pattern.length);
+                    if (!keepGoing) break;
+                  }
+                }
+              };
+
+              for (let i = 0; i < inlines.length; i++) {
+                const it = inlines[i];
+                searchInText(it.source, it.text, {
+                  source: it.source,
+                  url: 'data:text/javascript;charset=utf-8,' + encodeURIComponent(it.text),
+                  defaultName: `inline-${i}.js`
+                });
+                if (truncated && !wantDownload) break;
+              }
+
+              for (const u of extUrls) {
+                if ((truncated && !wantDownload) || Date.now() > deadline) break;
+                try {
+                  const ac = new AbortController();
+                  const t = setTimeout(() => ac.abort(), 6000);
+                  const res = await fetch(u, { credentials: 'include', cache: 'force-cache', signal: ac.signal });
+                  clearTimeout(t);
+                  if (!res.ok) { skipped.push({ source: u, reason: 'HTTP ' + res.status }); continue; }
+                  const text = await res.text();
+                  searchInText(u, text, { source: u, url: u });
+                } catch (e) {
+                  skipped.push({ source: u, reason: e && e.name === 'AbortError' ? 'timeout' : String(e && e.message || e) });
+                }
+              }
+
+              return {
+                scannedScripts: scanned,
+                matchedScripts: matchedMap.size,
+                totalHits: hits.length,
+                truncated,
+                hits,
+                skipped: skipped.length ? skipped : undefined,
+                toDownload: wantDownload ? Array.from(matchedMap.values()) : undefined
+              };
+            },
+            args: [{
+              pattern,
+              isRegex: msg.regex === true,
+              ctxLen: typeof msg.context === 'number' && msg.context >= 0 ? msg.context : 80,
+              maxHits: typeof msg.max_hits === 'number' && msg.max_hits > 0 ? msg.max_hits : 30,
+              sourcesFilter: msg.sources ? String(msg.sources) : null,
+              wantDownload
+            }]
+          });
+
+          const r = results && results[0] ? results[0].result : null;
+          if (!r || r.error) {
+            send(msg.id, { error: (r && r.error) || 'js_grep 执行失败' });
+            return;
+          }
+          if (wantDownload && Array.isArray(r.toDownload)) {
+            const downloaded = [];
+            for (let i = 0; i < r.toDownload.length; i++) {
+              const item = r.toDownload[i];
+              let fname = msg.filename || item.defaultName || undefined;
+              if (msg.filename && r.toDownload.length > 1) {
+                const dot = msg.filename.lastIndexOf('.');
+                fname = dot > 0 ? `${msg.filename.slice(0, dot)}_${i + 1}${msg.filename.slice(dot)}` : `${msg.filename}_${i + 1}`;
+              }
+              try {
+                const dl = await downloadUrlToDisk(item.url, fname, 60000);
+                downloaded.push({ source: item.source, path: dl.path, downloadId: dl.downloadId });
+              } catch (dlErr) {
+                downloaded.push({ source: item.source, error: dlErr.message || String(dlErr) });
+              }
+            }
+            delete r.toDownload;
+            r.downloaded = downloaded;
+          }
+          send(msg.id, { result: JSON.stringify(r) });
           return;
         }
 
@@ -1175,7 +1494,7 @@ function connect() {
             },
             args: [msg.storageType || 'local', msg.key || null]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -1192,7 +1511,7 @@ function connect() {
             },
             args: [msg.storageType || 'local', msg.key, msg.value]
           });
-          send(msg.id, { result: results[0].result });
+          sendResult(msg.id, results[0].result);
           return;
         }
 
@@ -1212,46 +1531,8 @@ function connect() {
         case 'download': {
           await resolveTab(msg);                               // 校验 tab 存在（下载本身由浏览器会话发起，带登录态）
           if (!msg.url) { send(msg.id, { error: '缺少 url/dataUrl' }); return; }
-          const opts = { url: msg.url, conflictAction: 'uniquify', saveAs: false };
-          if (msg.filename) opts.filename = msg.filename;      // 仅文件名，落浏览器默认下载目录
-          const downloadId = await chrome.downloads.download(opts);
-          const waitMs = msg.timeoutMs || 60000;
-          // 下载写盘是异步的：等 state=complete 再 search 取磁盘绝对路径（跨任意 Chromium 浏览器通用）
-          const path = await new Promise((resolve, reject) => {
-            let settled = false;                               // 守卫：监听/超时/兜底之间防重复完成与竞态误报
-            const finish = (fn, err) => {
-              if (settled) return;
-              settled = true;
-              clearTimeout(timer);
-              chrome.downloads.onChanged.removeListener(onChanged);
-              err ? reject(err) : resolve(fn);
-            };
-            const timer = setTimeout(() => finish(null, new Error('下载超时未完成')), waitMs);
-            // 按 downloadItem 的终态落定：complete→查磁盘路径；interrupted→报中断原因
-            const settleByItem = (it) => {
-              if (!it) return false;
-              if (it.state === 'complete') { finish(it.filename); return true; }
-              if (it.state === 'interrupted') {
-                finish(null, new Error('下载被中断: ' + (it.error || '未知'))); return true;
-              }
-              return false;
-            };
-            const onChanged = async (delta) => {
-              if (delta.id !== downloadId || settled) return;
-              if (!(delta.state && (delta.state.current === 'complete' || delta.state.current === 'interrupted'))) return;
-              try {
-                const [it] = await chrome.downloads.search({ id: downloadId });
-                if (settled) return;                           // await 期间可能已超时落定，避免覆盖
-                if (!settleByItem(it)) finish(null, new Error('下载完成但查不到文件记录'));
-              } catch (e) { finish(null, e); }
-            };
-            chrome.downloads.onChanged.addListener(onChanged);
-            // 兜底：极快下载可能在挂监听前就已到终态（complete 或 interrupted 都要处理）
-            chrome.downloads.search({ id: downloadId })
-              .then(([it]) => { if (!settled) settleByItem(it); })
-              .catch(() => {});                                // 兜底查询失败交给监听/超时，不产生未处理拒绝
-          });
-          send(msg.id, { result: JSON.stringify({ path, downloadId }) });
+          const dl = await downloadUrlToDisk(msg.url, msg.filename, msg.timeoutMs);
+          send(msg.id, { result: JSON.stringify(dl) });
           return;
         }
 
@@ -1351,6 +1632,10 @@ function connect() {
                   if (promptRe.test(joinFrom(baseI).replace(/\n+$/, '')) || promptRe.test(stripAnsi(buf.map(c => c.d).join('')).replace(/\n+$/, ''))) { ok = true; break; }
                 }
                 return { interrupted: ok, done: true };
+              }
+
+              if (!command || !String(command).trim()) {
+                return { error: '缺少 command 参数（非 read_only / interrupt 模式必填）' };
               }
 
               // 基线:发送前的 chunk 数,之后只截新增输出
@@ -1508,7 +1793,8 @@ function connect() {
               timeout: msg.timeout,
               idle_ms: msg.idle_ms,
               snapshot: !!msg.snapshot,
-              render_wait: msg.render_wait
+              render_wait: msg.render_wait,
+              auto_snapshot_ms: msg.auto_snapshot_ms
             }]
           });
           const r = results && results[0] ? results[0].result : null;
@@ -1518,8 +1804,13 @@ function connect() {
         }
 
         case 'scrolling_screenshot': {
-          // 截取目标 tab 当前可视区一屏
+          // 截取目标 tab 当前可视区一屏：
+          // captureVisibleTab 只能截取窗口当前处于激活态(active)的标签页；若目标 tab 在后台，先激活再截，防止截串页。
           const activeTab = await resolveTab(msg);
+          if (!activeTab.active) {
+            await chrome.tabs.update(activeTab.id, { active: true });
+            await new Promise(r => setTimeout(r, 80));
+          }
           const dataUrl = await chrome.tabs.captureVisibleTab(activeTab.windowId, { format: 'png' });
           send(msg.id, { result: JSON.stringify({ dataUrl }) });
           return;

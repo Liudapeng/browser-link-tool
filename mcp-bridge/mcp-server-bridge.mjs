@@ -335,13 +335,32 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "mcp_browser_get_network",
-    description: "读取页面发出的 fetch/XHR 请求记录(method/url/status/耗时ms)。⚠️ 首次调用只安装捕获钩子并返回 installed:true(此前的请求抓不到),需在触发操作后【再次调用】才拿到记录。with_body=true 附带响应体前 1000 字符。clear=true 读完清空。",
+    description: "读取页面发出的 fetch/XHR 请求记录(method/url/status/耗时ms)。⚠️ 首次调用只安装捕获钩子并返回 installed:true(此前的请求抓不到),需在触发操作后【再次调用】才拿到记录。with_body=true 附带响应体(默认前 1000 字符,可用 max_body 调大)。with_headers=true 附带请求/响应头(reqHeaders/resHeaders),逆向对比缺失头时用。clear=true 读完清空。with_body/with_headers/max_body 支持在读取时按需开启,无需重装钩子。",
     inputSchema: {
       type: "object",
       properties: {
         clear: { type: "boolean", description: "可选,读取后清空缓存,默认 false" },
-        with_body: { type: "boolean", description: "可选,是否附带响应体片段(前 1000 字符),默认 false" },
+        with_body: { type: "boolean", description: "可选,是否附带响应体片段,默认 false" },
+        with_headers: { type: "boolean", description: "可选,是否附带请求/响应头(reqHeaders/resHeaders),默认 false" },
+        max_body: { type: "number", description: "可选,响应体截断字符数,默认 1000" },
         max_items: { type: "number", description: "可选,最多返回最近 N 条,默认 50" },
+        ...TAB_TARGET_PROPS
+      }
+    }
+  },
+  {
+    name: "mcp_browser_js_grep",
+    description: "【逆向用】在页面已加载的 JS 源码(外部 script + 内联 script)里搜字符串/正则,定位某个值/参数的生成逻辑来源(如从 URL 参数反查它怎么被算出来)。默认只回命中片段(行号+列号+来源 url+上下文),绝不回全文,省 token 不压桥。download=true 则把匹配到的 bundle(或指定 sources)落盘返回磁盘路径,交本地脚本处理大文件。bundle 多/大时可用 sources 限定脚本 url 子串缩小范围。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "要搜的字符串或正则源(必填;仅当 download=true 且指定 sources 时可省略)" },
+        regex: { type: "boolean", description: "可选,pattern 当正则处理(默认 false,按纯字符串)" },
+        context: { type: "number", description: "可选,每个命中返回的上下文字符数,默认 80" },
+        max_hits: { type: "number", description: "可选,最多返回命中数,默认 30" },
+        sources: { type: "string", description: "可选,只搜 url 含该子串的脚本(缩小范围、规避超时)" },
+        download: { type: "boolean", description: "可选,为 true 时把命中(或 sources 限定)的 JS 落盘并返回磁盘路径" },
+        filename: { type: "string", description: "可选,download 时的落盘文件名" },
         ...TAB_TARGET_PROPS
       }
     }
@@ -404,8 +423,7 @@ const TOOL_DEFINITIONS = [
         render_wait: { type: "number", description: "可选,snapshot 模式等待一帧渲染完成的毫秒数,默认 2500" },
         auto_snapshot_ms: { type: "number", description: "可选,全屏刷新自动检测阈值:命令持续输出且始终等不到静默提示符达此毫秒数,则判定为刷新型命令自动中断取最后一帧,默认 4000" },
         ...TAB_TARGET_PROPS
-      },
-      required: ["command"]
+      }
     }
   }
 ];
@@ -415,7 +433,11 @@ const TOOL_DEFINITIONS = [
 function pickTabTargets(args) {
   const t = {};
   if (args.tabId != null) t.tabId = args.tabId;
-  if (args.url_match != null) t.url_match = args.url_match;
+  const um = args.url_match != null ? args.url_match : args.urlMatch;
+  if (um != null) {
+    t.url_match = um;
+    t.urlMatch = um; // 双字段下发，兼容新老版本扩展 background.js
+  }
   return t;
 }
 
@@ -440,7 +462,8 @@ const TOOL_ROUTES = {
   mcp_browser_hover: { path: '/hover', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, ...pickTabTargets(a) }) },
   mcp_browser_scroll_to: { path: '/scroll_to', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, ...pickTabTargets(a) }) },
   mcp_browser_get_console: { path: '/get_console', method: 'POST', bodyFn: (a) => JSON.stringify({ clear: a.clear, max_items: a.max_items, ...pickTabTargets(a) }) },
-  mcp_browser_get_network: { path: '/get_network', method: 'POST', bodyFn: (a) => JSON.stringify({ clear: a.clear, with_body: a.with_body, max_items: a.max_items, ...pickTabTargets(a) }) },
+  mcp_browser_get_network: { path: '/get_network', method: 'POST', bodyFn: (a) => JSON.stringify({ clear: a.clear, with_body: a.with_body, with_headers: a.with_headers, max_body: a.max_body, max_items: a.max_items, ...pickTabTargets(a) }) },
+  mcp_browser_js_grep: { path: '/js_grep', method: 'POST', bodyFn: (a) => JSON.stringify({ pattern: a.pattern, regex: a.regex, context: a.context, max_hits: a.max_hits, sources: a.sources, download: a.download, filename: a.filename, ...pickTabTargets(a) }) },
   mcp_browser_inspect_element: { path: '/inspect_element', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, x: a.x, y: a.y, ...pickTabTargets(a) }) },
   mcp_browser_pick_element: { path: '/pick_element', method: 'POST', bodyFn: (a) => JSON.stringify({ cancel: a.cancel, ...pickTabTargets(a) }) },
   mcp_browser_dom_tree: { path: '/dom_tree', method: 'POST', bodyFn: (a) => JSON.stringify({ scope: a.scope, max_depth: a.max_depth, max_nodes: a.max_nodes, include_text: a.include_text, ...pickTabTargets(a) }) },
@@ -471,6 +494,7 @@ const HTTP_ACTION_MAP = {
   '/scroll_to': 'scroll_to',
   '/get_console': 'get_console',
   '/get_network': 'get_network',
+  '/js_grep': 'js_grep',
   '/get_storage': 'get_storage',
   '/set_storage': 'set_storage',
   '/get_cookies': 'get_cookies',
@@ -595,7 +619,7 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       const id = currentId++;
       let timeoutMs;
       if (action === 'scrolling_screenshot') timeoutMs = 120000;
-      else if (action === 'wait_for') timeoutMs = 65000;
+      else if (action === 'wait_for' || action === 'js_grep') timeoutMs = 65000;
       else if (action === 'arthas_exec') timeoutMs = Math.max((extraPayload.timeout || 60000) + 5000, 65000);
       else if (action === 'download') timeoutMs = Math.max((extraPayload.timeoutMs || 60000) + 5000, 65000);
       else timeoutMs = 15000;
@@ -882,7 +906,7 @@ let primaryResources = await tryStartPrimary();
 // primaryResources 为 null 说明当前进程作为 PROXY 运行，请求透明转发至 127.0.0.1:48766。
 
 const server = new Server(
-  { name: "browser_link_tool", version: "1.0.0" },
+  { name: "browser_link_tool", version: "1.5.0" },
   { capabilities: { tools: {} } }
 );
 

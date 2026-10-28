@@ -251,15 +251,28 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 
 | 工具 | 能力 |
 |---|---|
+| `mcp_browser_outline` | 返回可交互元素精简清单(带可用 selector / 文本 / 状态,默认过滤遮挡) |
+| `mcp_browser_dom_tree` | 返回 DOM 结构骨架树(层级 + tag#id.class[data-*] + 子节点数,同类兄弟折叠) |
+| `mcp_browser_inspect_element` | 取证单个元素,返回多种候选 selector(按稳定性排序)+ 属性 + 祖先链 |
+| `mcp_browser_pick_element` | 点选取证(用户在页面点击目标元素,读取候选 selector 与属性) |
+| `mcp_browser_detect_env` | 探测页面前端框架及版本、window 自定义全局变量、script 来源域 |
 | `mcp_browser_snapshot` | 获取页面完整 HTML |
+| `mcp_browser_get_element` | 读取单个元素状态(visible/disabled/rect)或属性(value/text/html) |
 | `mcp_browser_evaluate` | 执行任意 JS 并返回结果 |
-| `mcp_browser_click` | CSS 选择器点击 |
-| `mcp_browser_fill` | 填充输入框 / contenteditable |
+| `mcp_browser_click` | CSS 选择器点击(含 disabled 拦截与自动滚入视口) |
+| `mcp_browser_fill` | 填充输入框 / contenteditable(原生原型 setter 穿透 React/Vue 受控组件) |
+| `mcp_browser_select_option` | 为原生 `<select>` 选中选项(按 value 或显示文本) |
+| `mcp_browser_press_key` | 真实键盘输入(CDP 优先,支持字符录入与 Tab/Enter/Esc 默认行为) |
+| `mcp_browser_hover` | 鼠标悬停(触发 JS 监听) |
+| `mcp_browser_scroll_to` | 将目标元素滚动到视口中央 |
 | `mcp_browser_navigate` | 跳转 URL |
 | `mcp_browser_scrolling_screenshot` | 截当前可视区一屏(PNG) |
 | `mcp_browser_list_tabs` | 列出所有标签页(拿 tabId) |
 | `mcp_browser_activate_tab` | 激活指定标签页 |
 | `mcp_browser_wait_for` | 等待元素出现(可选可见性 / 文本) |
+| `mcp_browser_get_console` | 读取页面 console 日志与运行时报错(首调装钩子) |
+| `mcp_browser_get_network` | 读取页面 fetch/XHR 请求记录,支持按需附带响应体(`with_body`/`max_body`)与请求/响应头(`with_headers`) |
+| `mcp_browser_js_grep` | 在页面已加载的 JS 源码中搜索字符串/正则(返回行号+上下文),支持将匹配 bundle 下载落盘 |
 | `mcp_browser_get_storage` / `set_storage` | 读写 localStorage / sessionStorage |
 | `mcp_browser_get_cookies` / `set_cookies` | 读写 Cookie |
 | `mcp_browser_download_url` | 让浏览器带登录态下载 URL 并等写盘完成，返回文件磁盘真实绝对路径（跨 Chromium 浏览器通用、无需猜下载目录）；用于把大体量接口数据经磁盘交本地脚本处理，正文不进模型 |

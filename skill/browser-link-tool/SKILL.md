@@ -33,7 +33,8 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 | `mcp_browser_wait_for` | `selector`,`text?`,`visible?`,`timeout?` | 等待元素出现 |
 | `mcp_browser_scrolling_screenshot` | `output_path?` | 截当前可视区一屏 → PNG 路径 |
 | `mcp_browser_get_console` | `clear?`,`max_items?` | 读 console 日志/报错(⚠️首调仅装钩子) |
-| `mcp_browser_get_network` | `clear?`,`with_body?`,`max_items?` | 读 fetch/XHR 请求记录(⚠️首调仅装钩子) |
+| `mcp_browser_get_network` | `clear?`,`with_body?`,`with_headers?`,`max_body?`,`max_items?` | 读 fetch/XHR 请求记录(⚠️首调仅装钩子;读取时可按需开启 body/headers) |
+| `mcp_browser_js_grep` | `pattern?`,`regex?`,`context?`,`max_hits?`,`sources?`,`download?`,`filename?` | 在页面已加载的 JS 源码里搜字符串/正则(定位参数生成逻辑),或将匹配 bundle 落盘返回磁盘路径 |
 | `mcp_browser_get_storage` | `storageType?`,`key?` | 读 local/session storage |
 | `mcp_browser_set_storage` | `storageType?`,`key`,`value` | 写 storage |
 | `mcp_browser_get_cookies` | `url?`,`name?` | 读 Cookie |
@@ -86,7 +87,8 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 
 - **首次调用只安装钩子**，返回 `installed:true`、日志/请求为空——**此前发生的日志和请求抓不到**。
 - 正确用法：**先调一次装钩子 → 触发页面操作（点击/提交/跳转）→ 再调一次读取**。
-- `get_network` 默认只给 method/url/status/耗时；要看响应体传 `with_body:true`（截前 1000 字符）。
+- `get_network` 默认只给 method/url/status/耗时；要看响应体传 `with_body:true`（默认前 1000 字符，可用 `max_body` 调大），要看请求/响应头传 `with_headers:true`（支持在读取时按需开启，无需重装钩子）。
+- `js_grep` 可直接在页面已加载的外部/内联 JS 源码里检索字符串或正则（返回行号+上下文），或配合 `download:true` 将命中的 bundle 下载到磁盘交本地脚本分析。
 - `clear:true` 读完清空，便于下一轮只看增量。
 - 局限：`navigate`/刷新会重建页面、钩子丢失，需重新装；跨页面持续追踪不适用。
 

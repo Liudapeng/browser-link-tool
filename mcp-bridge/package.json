@@ -1,6 +1,6 @@
 {
   "name": "browser-link-tool",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "浏览器 MCP 控制桥 - 让 AI 在你眼前的浏览器里自主调试前端页面(读控制台报错/抓接口/截图自测),并在 Arthas Web 控制台诊断 Java 应用",
   "author": "liudapeng",
   "homepage": "https://github.com/Liudapeng/browser-link-tool#readme",
