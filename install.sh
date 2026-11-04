@@ -91,7 +91,7 @@ EOF
   fi
 fi
 
-# ── 4. 安装 Skill（Claude Code / Codex / Gemini，各家 skills 目录存在才铺）──
+# ── 4. 安装 Skill（Claude Code / Codex / Gemini / JoyCode / .agents，客户端配置根存在才铺）──
 if [ -x "$SCRIPT_DIR/sync-skills-local.sh" ]; then
   echo "==> 安装 Skill…"
   "$SCRIPT_DIR/sync-skills-local.sh" || true
