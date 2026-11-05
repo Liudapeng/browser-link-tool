@@ -71,7 +71,7 @@ browser-link-tool/
   }
   ```
 
-> **Skill(可选,不装也能用)**:只是让 Agent「知道何时该用这套工具」。需要的话把仓库 `skill/browser-link-tool/` 整个目录拷到 skills 目录(Claude Code:`~/.claude/skills/`;Codex:`~/.codex/skills/`,视版本);目录拿不准就跳过。
+> **Skill(可选,不装也能用)**:只是让 Agent「知道何时该用这套工具」。需要的话把仓库 `skill/browser-link-tool/` 整个目录拷到 skills 目录(Claude Code:`~/.claude/skills/`;Codex:`~/.agents/skills/`(新版也读 `~/.codex/skills/`,两处只放一份,否则 / 列表重复));目录拿不准就跳过。
 
 > **⚠️ Node 版本可自定义(卡在「正在启动…」多半是这个原因)**:MCP 客户端会用它自己 PATH 里的 `node`/`npx`。若那个 node < 18,`npx` 会因 `engines` 不满足而装不上、命令找不到,表现为**一直卡在启动**。解决:把 `command` 换成 **node ≥18 的 npx 绝对路径**(不是裸 `npx`):
 >

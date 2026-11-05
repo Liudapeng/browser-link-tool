@@ -16,18 +16,30 @@ install_one() {  # $1 = skills 目录;仅当其上级(客户端配置根)已存�
   local root; root="$(dirname "$skills_dir")"
   [ -d "$root" ] || { echo "[skill-sync] 跳过 $skills_dir(未检测到 $root)"; return; }
   local dst="$skills_dir/$MCP_NAME"
+  # Codex 同时加载 ~/.codex/skills(旧位置)与 ~/.agents/skills(标准位置),两处都铺会在 / 技能列表里重复;
+  # ~/.agents/skills 存在时只铺那里,并清掉 ~/.codex/skills 下的同名副本
+  if [ "$skills_dir" = "$HOME/.codex/skills" ] && [ -d "$HOME/.agents/skills" ]; then
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      rm -rf "$dst"
+      echo "[skill-sync] ✖ 删除重复副本 $dst(Codex 从 ~/.agents/skills 加载)"
+    else
+      echo "[skill-sync] 跳过 $skills_dir(Codex 从 ~/.agents/skills 加载)"
+    fi
+    return
+  fi
   mkdir -p "$dst"
   cp "$SKILL_SRC" "$dst/SKILL.md"
   echo "[skill-sync] ✔ $dst/SKILL.md"
 }
 
+# ~/.agents/skills 必须在 ~/.codex/skills 之前铺:判断 Codex 是否改从标准位置加载时,它要已经存在
 for d in \
   "$HOME/.claude/skills" \
+  "$HOME/.agents/skills" \
   "$HOME/.codex/skills" \
   "$HOME/.gemini/skills" \
   "$HOME/.gemini/config/skills" \
-  "$HOME/.joycode/skills" \
-  "$HOME/.agents/skills"
+  "$HOME/.joycode/skills"
 do
   install_one "$d"
 done
