@@ -20,7 +20,7 @@
 | 目录 | 构件 | 作用 | 装到哪(宿主) | 由谁 / 如何加载 |
 |---|---|---|---|---|
 | `extension/` | Chrome 扩展(MV3) | 在浏览器里实际执行注入、抓页面、连 bridge | 浏览器(Chrome / Edge) | 手动:`chrome://extensions` → 开发者模式 →「加载已解压的扩展程序」选**此目录**;常驻后台 service worker |
-| `mcp-bridge/` | MCP 桥(Node 进程) | 向 AI 暴露 MCP 工具,HTTP↔WebSocket 转发给扩展 | 装了 Node ≥ 18 的机器 | AI Agent 按其 MCP 配置以 **stdio 拉起** `mcp-server-bridge.mjs`(会话启动时);首个进程占 48765/48766 为主实例,余者降级为代理 |
+| `mcp-bridge/` | MCP 桥(Node 进程) | 向 AI 暴露 MCP 工具,HTTP↔WebSocket 转发给扩展 | 装了 Node ≥ 18 的机器 | AI Agent 按其 MCP 配置以 **stdio 拉起** `mcp-server-bridge.mjs`(会话启动时)作轻量 client;client 按需拉起全机唯一的常驻 daemon 占 48765/48766 |
 | `skill/` | Skill 说明 | 告诉 Agent 何时用、怎么用、线上安全准则 | AI Agent 的 skills 目录 | 把 `skill/browser-link-tool/` **整个目录**复制到 `~/.claude/skills/`、`~/.codex/skills/` 等(skills 约定每个 skill 一个同名文件夹);也提供 `browser-link-tool.zip` 便于分发 |
 
 ```
@@ -38,7 +38,11 @@ browser-link-tool/
 │   ├── browser-link-tool/        # skill 目录(整个拷到 Agent skills 目录)
 │   │   └── SKILL.md
 │   └── browser-link-tool.zip     # 打包分发副本
-├── install.sh                    # 一键安装
+├── install.sh                    # 一键安装(唯一入口)
+├── scripts/                      # 维护脚本
+│   ├── bump-version.sh           # 版本同步:一键改写 bridge/扩展/skill 三处版本(--check 只校验)
+│   ├── sync-skills-local.sh      # 把 SKILL.md 铺到本机各客户端 skills 目录
+│   └── sync-to-github.sh         # 推送到 GitHub 独立镜像仓(本地私有,不入库)
 ├── SHARING.md                    # 分享/介绍文档
 └── README.md
 ```
@@ -125,7 +129,7 @@ Chrome 扩展无法经 npm 分发,须从仓库获取 `extension/` 目录手动�
 
 ### 2. 自检全链路就绪
 
-1. **扩展已连接**:点工具栏图标,面板显示「扩展连接:已连接」。同一时刻只保留一个连 bridge 的扩展(其他连 48765 端口的扩展请停用,避免端口争用)。
+1. **扩展已连接**:点工具栏图标,面板显示「扩展连接:已连接」。Chrome / Edge / 多个 profile 可各装一份扩展同时连上(见[多浏览器](#多标签页--多会话定向))。
 2. **MCP 已注册**:Claude Code 执行 `claude mcp list`、Codex 执行 `codex mcp list`,应看到 `browser-link-tool`(其他 Agent 用各自的 MCP 管理入口确认)。
 3. **工具已进会话**:MCP 在会话启动时加载。**若在会话运行中才注册 MCP,需重启该会话**,`mcp_browser_*` 工具才会出现。
 
@@ -203,6 +207,7 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 - **每会话自动绑定**:每个 AI 会话首次操作某标签页后,该会话就自动"记住"这个 tab——之后不带 `tabId` 的调用都只作用于它。多个会话(Claude / Gemini / Codex …)并发时各自绑各自的 tab,**不用手动指定也互不串扰**。
 - **显式切换**:任何调用带 `tabId`(先 `list_tabs` 拿)或 `url_match`(URL 子串,如 `url_match: "github.com"`)即操作该 tab,并把当前会话重新绑定到它。
 - **优先级**:显式 `tabId` / `url_match` > 该会话已绑定的 tab > 当前活动 tab(会话首次操作时用活动 tab 并绑定)。绑定的 tab 关闭后自动解绑。
+- **多浏览器**:Chrome / Edge / 多个 profile 可同时连 daemon。`list_tabs` 列出全部浏览器的标签页(每项带 `browser` / `browserName`),所有工具可带 `browser`(id 或名称片段,如 `"edge"`)指定浏览器;不带时按 本会话上次用的 > 唯一已连 > 最近获得焦点的 浏览器。各浏览器 tabId 独立编号可能撞号,撞号时会要求补 `browser`。浏览器名可在扩展面板「本浏览器名」处改。
 
 ### 在 Arthas Web 控制台诊断 Java 应用
 
@@ -277,13 +282,14 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 | `mcp_browser_get_cookies` / `set_cookies` | 读写 Cookie |
 | `mcp_browser_download_url` | 让浏览器带登录态下载 URL 并等写盘完成，返回文件磁盘真实绝对路径（跨 Chromium 浏览器通用、无需猜下载目录）；用于把大体量接口数据经磁盘交本地脚本处理，正文不进模型 |
 | `mcp_browser_arthas_exec` | 在 Arthas Web 控制台投递命令并采集执行结果 |
+| `mcp_browser_connection_info` | 只读诊断:桥 / 扩展 / skill 三端版本与同代结论,不操作页面 |
 
-除 `list_tabs` 外,所有工具均支持可选 `tabId` / `url_match` 定向目标标签页。
+除 `list_tabs` 外,所有工具均支持可选 `tabId` / `url_match` 定向目标标签页;所有工具均支持可选 `browser` 定向浏览器(多浏览器同时连接时)。
 
 ### 扩展面板
 
-- **连接状态**:Bridge 服务是否运行、扩展是否连接。
-- **活跃会话**:实时列出当前在线的 AI 会话——客户端名(自动识别 Claude / Gemini / Codex …)、主 / 代理模式、正在操作的标签页、绿点(近期活跃)/ 灰点(在线空闲)、接入时长与调用次数。每 3 秒自动刷新。
+- **连接状态**:Bridge daemon 是否运行(及版本)、本浏览器是否连上、多浏览器在线清单;「本浏览器名」可改(agent 用它经 `browser` 参数定向)。「版本」行并列显示 `扩展 vX ↔ 桥 vY`,不一致时转红并直接给出处置建议(多半是忘了重载扩展)。
+- **使用中的会话**:只列**调用过浏览器工具**的 AI 会话(每个 agent 会话一启动就会挂上 MCP,没用过浏览器的折叠成「另有 N 个…」一行,悬停可看是谁)——客户端名(自动识别 Claude / Gemini / Codex / JoyCode …)、宿主与项目(`@Antigravity · 仓库名`,区分同名会话)、正在操作的标签页、绿点(90 秒内有操作)/ 灰点(用过但近期空闲)、接入时长与调用次数;悬停客户端名可看 MCP 握手上报的原始 clientInfo。每 3 秒自动刷新。一行 = 一条 MCP 连接(agent 拉起的一个 bridge 进程),不等于一个聊天对话(MCP 协议没有对话 ID)。客户端名以 MCP 握手上报的 `clientInfo`(title,无则 name)为准:常见品牌规范成展示名,认不出的原样展示;只有拿不到 clientInfo 时才退回 `BRIDGE_CLIENT` 环境变量 / 进程链 / 环境变量探测。基于 Codex 内核的客户端(如 JoyCode)自报 `codex-mcp-client`,会显示为 Codex。
 - **快捷操作**:复制当前活动 Tab 信息(含 tabId)、刷新。
 
 ---
@@ -291,10 +297,12 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 ## 架构与实现原理
 
 ```
-AI Agent ──MCP stdio──► mcp-bridge/mcp-server-bridge.mjs ──HTTP:48766──► WebSocket:48765 ──► extension/(Chrome 扩展) ──► 目标网页
+AI Agent ──MCP stdio──► client(每会话一个) ──临时 HTTP:48766──► 常驻 daemon ◄──WebSocket:48765 长连接(每浏览器一条)── extension/(Chrome/Edge 扩展) ──► 目标网页
 ```
 
-- **主 / 代理多实例**:首个进程占用 48765 / 48766 成为主实例;后续进程自动降级为代理,经 48766 转发。多个 agent 会话可并存。
+- **常驻 daemon + 轻量 client**:agent 拉起的 `mcp-server-bridge.mjs` 只是 client,不占端口,每次工具调用是一次临时 HTTP 请求;全机唯一的 daemon(`--daemon`,detached 后台进程)独占 48765/48766、与扩展保持长连接,不随任何 agent 会话退出。client 启动或调用时发现 daemon 不在(被杀/崩溃)就自动拉起,扩展约 2s 内重连;所有会话关闭 10 分钟后 daemon 自退。日志在 `~/.browser-link-tool/daemon.log`。
+- **升级与版本同代**:三处版本(`mcp-bridge/package.json`、`extension/manifest.json`、`skill/**/SKILL.md`)由 `./scripts/bump-version.sh <版本号>` 一条命令统一改写,**不要手改单处**——半升级(新桥配旧扩展)的症状是"某些工具莫名其妙报错",极难查。`./scripts/bump-version.sh --check` 只校验不改,`install.sh` 已内置该闸门,不一致直接拒装。升级后扩展要在 `chrome://extensions` 点重载;桥侧 daemon 由新版 client 自动替换(按 版本号+脚本修改时间 比较,只新替旧、不会互踢),手动重启用 `pkill -f browser-link-tool-daemon`,各会话下次调用自动重拉、无需重启 agent。
+- **版本不一致怎么发现**:扩展 `hello` 握手上报自己的版本与代码加载时刻,daemon 据此判定三种状态——版本号不符 / 源码改了但扩展没重载(`stale-code`,拿磁盘 mtime 与扩展代码加载时刻比)/ 扩展太旧没上报版本。不一致时**只告警不阻断**:工具返回首行插一行 `⚠️ 版本不一致 …`、扩展面板「版本」行转红给出建议、daemon 日志记一条;完整三端清单调 `mcp_browser_connection_info`(只读,不碰页面)。
 - **多会话定向**:每会话自动绑定首次操作的 tab;显式 `tabId` / `url_match` 可切换并重新绑定。优先级 显式 > 会话绑定 > 当前活动 tab。
 
 普通网页操作走常规套路:扩展经 `chrome.scripting.executeScript` 把脚本注入目标页执行、回传结果。真正有门道的是 Arthas 控制台桥接——以下是几个「不写清楚就会踩坑」的机制。
@@ -347,7 +355,9 @@ ws.onmessage = e => term.write(e.data)
 
 - **MCP 一直卡在「正在启动…」/ 启动超时**:客户端 PATH 里的 node < 18,`npx` 因 `engines` 装不上导致命令找不到。把配置 `command` 换成 node ≥18 的 **npx 绝对路径**(`which npx` 查,须对应 v18+),或改用方式 C 直接用 node 绝对路径跑本地脚本;必要时先 `rm -rf ~/.npm/_npx` 清缓存。
 - **工具不存在 / 调不到**:MCP 未注册或会话未重启 → 确认注册后重启会话(Claude Code 用 `claude mcp list` 核对)。
-- **`No Chrome Extension connected`**:扩展面板显示未连接,或 bridge 未运行 → 检查扩展是否启用、端口是否被别的 bridge 占用。
+- **`No Chrome Extension connected`**:扩展面板显示未连接 → 检查扩展是否启用、是否有别的扩展也在连 48765。
+- **`tabId N exists in multiple browsers`**:多浏览器下 tabId 撞号 → 调用时带上 `list_tabs` 该条目的 `browser`。
+- **`Bridge daemon ... could not be (re)started`**:看 `~/.browser-link-tool/daemon.log` 末尾;常见是端口被其他程序占用(`lsof -i :48766`)。
 - **`Cannot snapshot internal browser pages`**:`chrome://` / `edge://` / `about:` 页面无法注入,切到普通网页。
 - **元素找不到**:先 `snapshot` 看真实 DOM 再取选择器;动态渲染的先 `wait_for`。
 - **`arthas_exec` 报 `ws hook 未安装`**:扩展刚装 / 重载,Arthas 页面在 hook 注入前就已建立 WebSocket → **刷新一次 Arthas 页面**即可。可先 `read_only: true` 看 `wsReadyState:1` 确认已捕获连接。

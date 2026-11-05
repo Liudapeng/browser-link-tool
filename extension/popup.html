@@ -20,8 +20,37 @@
           </defs>
         </svg>
         <h1 class="title">Browser Link Tool</h1>
+        <button class="icon-btn" id="installToggle" title="MCP 安装说明" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>
+          </svg>
+        </button>
       </div>
       <p class="subtitle">浏览器 MCP 控制桥</p>
+    </div>
+
+    <!-- MCP 安装说明:点 header 图标展开 -->
+    <div class="section install-panel" id="installPanel" hidden>
+      <div class="section-title">MCP 安装（npm · 需 Node ≥ 18）</div>
+      <div class="install-item">
+        <div class="install-label">Claude Code</div>
+        <code class="install-cmd" title="点击复制">claude mcp add browser-link-tool -s user -- npx -y browser-link-tool</code>
+      </div>
+      <div class="install-item">
+        <div class="install-label">Codex</div>
+        <code class="install-cmd" title="点击复制">codex mcp add browser-link-tool -- npx -y browser-link-tool</code>
+      </div>
+      <div class="install-item">
+        <div class="install-label">JoyCode · 追加到 ~/.joycode/config.toml</div>
+        <code class="install-cmd" title="点击复制">[mcp_servers.browser-link-tool]
+command = "npx"
+args = ["-y", "browser-link-tool"]</code>
+      </div>
+      <div class="install-item">
+        <div class="install-label">其他客户端 · mcpServers JSON</div>
+        <code class="install-cmd" title="点击复制">"browser-link-tool": { "command": "npx", "args": ["-y", "browser-link-tool"] }</code>
+      </div>
+      <div class="install-note">点击命令即复制 · 注册后重开 agent 会话生效 · 卡在启动多为 node &lt; 18,把 npx 换成 node ≥ 18 的 npx 绝对路径</div>
     </div>
 
     <!-- Connection Status -->
@@ -38,16 +67,31 @@
           <span class="status-label">扩展连接</span>
           <span class="status-value" id="extValue">检测中…</span>
         </div>
+        <div class="status-row">
+          <span class="status-dot idle" id="nameDot"></span>
+          <span class="status-label">本浏览器名</span>
+          <label class="alias-wrap" title="点击改名 · 回车保存 · 清空恢复默认&#10;多浏览器同时连接时,agent 用此名(或 id)经 browser 参数定向">
+            <input class="alias-input" id="aliasInput" spellcheck="false" maxlength="40">
+            <svg class="alias-edit" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>
+          </label>
+        </div>
+        <div class="browsers-line" id="browsersLine" hidden></div>
+        <div class="status-row">
+          <span class="status-dot idle" id="versionDot"></span>
+          <span class="status-label">版本</span>
+          <span class="status-value" id="versionValue">检测中…</span>
+        </div>
+        <div class="version-warn" id="versionWarn" hidden></div>
       </div>
     </div>
 
     <!-- Active Agent Sessions -->
     <div class="section">
       <div class="section-title-row">
-        <span class="section-title">活跃会话</span>
+        <span class="section-title">使用中的会话</span>
         <span class="count-badge" id="sessionCount">0</span>
       </div>
-      <div class="session-hint">近 90 秒内有操作的 agent 会话</div>
+      <div class="session-hint">调用过浏览器工具的 agent 会话 · 绿点 = 90 秒内有操作</div>
       <div class="session-list" id="sessionList"></div>
     </div>
 

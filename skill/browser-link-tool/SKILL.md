@@ -3,6 +3,8 @@ name: browser-link-tool
 description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/真实键盘输入/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、让浏览器带登录态下载 URL 到磁盘并返回真实绝对路径、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。还可用于**前端开发自测闭环**：改完代码后在用户当前已打开的 localhost 标签页里触发交互、读控制台报错、抓接口请求、截图确认渲染，自测通过再交卷（登录态与弹窗层级完整保留，HMR 原地取证）。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc/逐字符输入」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「下载页面/接口数据到本地/把大数据落盘交脚本处理」「在指定标签页执行」「多个会话分别控制不同 tab」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或**在本地开发前端页面时要求「改完测一下交互/看看有没有报错/截图确认效果/自测后再交付」**，或提到 mcp_browser_* 工具时使用。
 ---
 
+<!-- blt-version: 1.6.0 -->
+
 # Browser Link Tool — 浏览器 MCP 操控
 
 用 `mcp_browser_*` 系列工具操控真实浏览器。前提：Browser Link Tool 扩展已加载且面板显示「已连接」，bridge 已注册为 MCP Server（见插件目录 `install.sh`）。
@@ -13,7 +15,7 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 
 | 工具 | 入参（除 tabId/url_match 外） | 用途 |
 |---|---|---|
-| `mcp_browser_list_tabs` | 无 | 列出所有 tab，拿 `tabId` |
+| `mcp_browser_list_tabs` | 可选 `browser` | 列出所有 tab，拿 `tabId`（多浏览器时每项带 `browser`） |
 | `mcp_browser_activate_tab` | — | 激活/聚焦指定 tab |
 | `mcp_browser_outline` | `scope?`,`include_hidden?`,`max_items?` | ⭐ 可交互元素精简清单(带 selector/文本/状态)，定位元素首选 |
 | `mcp_browser_dom_tree` | `scope?`,`max_depth?`,`max_nodes?`,`include_text?` | DOM 结构骨架树(层级+tag#id.class+data)，看页面结构 |
@@ -41,6 +43,7 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 | `mcp_browser_set_cookies` | `url?`,`name`,`value`,… | 写 Cookie |
 | `mcp_browser_download_url` | `url`(或`dataUrl`),`filename?`,`timeoutMs?` | 浏览器带登录态下载 URL 并等写盘完成，返回文件磁盘真实绝对路径（跨 Chromium 浏览器通用，把大数据经磁盘交本地脚本、不进模型） |
 | `mcp_browser_arthas_exec` | `command`,`timeout?`,`idle_ms?`,`read_only?`,`interrupt?`,`snapshot?`,`render_wait?`,`auto_snapshot_ms?` | 在 Arthas Web 控制台投递命令并采集输出 |
+| `mcp_browser_connection_info` | — | 只读诊断:桥/扩展/skill 三端版本与同代结论,不碰页面 |
 
 ## 多会话定向（关键）
 
@@ -50,6 +53,7 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 - **显式切换**:任何调用带 `tabId`(先 `list_tabs` 拿)或 `url_match`(URL 子串)即操作该 tab,并把本会话重新绑定到它。
 - **优先级**:显式 `tabId` / `url_match` > 本会话已绑定的 tab > 当前活动 tab(首次操作时用活动 tab 并绑定)。
 - **要严格作用于某 tab 时**:优先显式带 `tabId`,最稳妥;不带时依赖自动绑定,首次操作前请确认当前活动 tab 是你想要的。
+- **多浏览器(Chrome/Edge/多 profile 同时连)**:`list_tabs` 每项多出 `browser`(id)/`browserName`;所有工具可带 `browser`(id 或名称片段如 `"edge"`)指定浏览器。**各浏览器 tabId 独立编号会撞号**:带 `tabId` 时一并带上同条目的 `browser`;撞号未指明会报 `exists in multiple browsers`,补 `browser` 重试即可。不带 `browser` 时按 本会话上次用的浏览器 > 唯一已连 > 最近获得焦点的 选择。
 
 ## 标准操作范式
 
@@ -161,10 +165,14 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 - **截图**:`scrolling_screenshot` 截当前可视区一屏(不滚动拼接),返回 PNG 文件路径,随后可用 Read 查看。
 - **wait_for 超时**：默认 10s，慢页面显式加大 `timeout`。
 - **内部页不可操作**：`chrome://` / `edge://` / `about:` 无法 snapshot/注入。
+- **版本不一致告警(工具返回首行出现 `⚠️ 版本不一致`)**：桥与浏览器扩展不同代。**不阻断调用**,但此时的工具行为不可全信(新桥可能调到旧扩展没有的 action)。处置:让用户去 `chrome://extensions` 点 Browser Link Tool 的刷新按钮重载扩展;重载后告警自动消失。想看完整三端版本就调 `mcp_browser_connection_info`(只读,不碰页面),它直接给出 `verdict` 与 `problems` 清单。常见三种:扩展版本号与桥不符、扩展源码改了但没重载、skill 副本没跟着 `scripts/sync-skills-local.sh` 分发。
 - **未连接报错**：若返回「No Chrome Extension connected」，说明 bridge 活着但浏览器扩展没连上——提示用户检查扩展面板是否「已连接」、bridge 是否运行（**这类不要自己重启 bridge**，是扩展侧的事）。
-- **`Transport closed` / MCP 连接断——自愈,别干等用户**：这是本会话的 MCP stdio 传输断了（常见于 bridge 进程被重启/杀掉后没自动拉起）。按以下流程自起一条**专属** bridge 恢复，无需用户操作：
-  1. 启动独立进程 `node <本工具目录>/mcp-bridge/mcp-server-bridge.mjs`（路径见 MCP 配置里的 args）。
+- **bridge 结构**：全机一个常驻 daemon(`mcp-server-bridge.mjs --daemon`,独占 48765/48766、与扩展保持长连接,日志 `~/.browser-link-tool/daemon.log`);每个 agent 会话拉起的只是轻量 client,每次工具调用是一次临时 HTTP 请求。daemon 不在/崩了,client 下次调用会**自动拉起**,别自己修。
+- **`unreachable and could not be (re)started`**：client 已就地尝试拉起 daemon 仍失败——读 `~/.browser-link-tool/daemon.log` 末尾找原因(多半端口被别的程序占用或 daemon 卡死)。daemon 卡死可 `pkill -f browser-link-tool-daemon` 后重试一次(**只杀 daemon 是安全的**:各会话的 client 不受影响,下次调用自动重拉);仍失败就停下告诉用户。
+- **🚨 桥不通时禁止改用其他浏览器工具**：不得切到 browser-use / Playwright / agent 内置浏览器等替代方案——它们不是用户眼前那个已登录的浏览器,登录态、tab、数据都对不上,查出来的结论不可信。修不通就停下告诉用户。
+- **`Transport closed` / MCP 连接断——自愈,别干等用户**：这是本会话的 client 进程没了(被杀/agent 侧断开)。按以下流程自起一条**专属** client 恢复，无需用户操作：
+  1. 启动独立进程：MCP 配置 args 是本地 `mcp-server-bridge.mjs` 路径就 `node <该路径>`;是 npx 安装(args 为 `-y browser-link-tool`)就 `npx -y browser-link-tool`。**别去工作区里找脚本**,它不在业务仓库里。
   2. 走完 MCP 握手：`initialize` → `notifications/initialized` → `tools/list`。
   3. 之后经这条 stdio 连接正常 `tools/call` 调 `mcp_browser_*`。
-  - **为什么安全**：bridge 是「主实例 + 代理」架构——已有主实例（连着浏览器 WS）时，你新起的进程会自动进入 **PROXY 模式**转发，不抢端口、空闲自退、不影响别人。
-  - **🚨 红线**：只能起**你自己的**独立 bridge；**严禁 `pkill`/重启/杀掉其他 agent 会话的 bridge 进程**（会导致别的会话 `Transport closed`）。主实例进程尤其不能杀（它一退，浏览器连接就断）。
+  - 做不到(如 shell 无法维持交互式 stdio 进程)就直接请用户重启本 agent 的 MCP(Claude Code `/mcp` 重连;Codex/JoyCode 重开会话),不要转用其他浏览器工具。
+  - **🚨 红线**：**严禁 `pkill -f mcp-server-bridge` 这类无差别杀进程**——杀不到 daemon(进程名已改),反而连带杀掉其他 agent 会话的 client,Codex/JoyCode 不会自动重拉,直接 `Transport closed`。

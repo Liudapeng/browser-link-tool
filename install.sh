@@ -44,6 +44,16 @@ fi
 NPM_BIN="$(dirname "$NODE_BIN")/npm"
 echo "==> 使用 Node: $NODE_BIN ($("$NODE_BIN" -v))"
 
+# ── 1b. 版本一致性闸门 ─────────────────────────────────────
+# 三处版本(bridge/扩展/skill)必须同代才让装:否则装完也是"新桥配旧扩展",出问题还难查
+if [ -f "$SCRIPT_DIR/scripts/bump-version.sh" ]; then
+  echo "==> 校验版本一致性…"
+  if ! bash "$SCRIPT_DIR/scripts/bump-version.sh" --check; then
+    echo "!! 请先执行 ./scripts/bump-version.sh <version> 统一版本后重装" >&2
+    exit 1
+  fi
+fi
+
 # ── 2. 安装依赖（mcp-bridge/）─────────────────────────────
 echo "==> 安装依赖 (npm install @ mcp-bridge)…"
 ( cd "$BRIDGE_DIR" && "$NPM_BIN" install --no-audit --no-fund )
@@ -91,10 +101,112 @@ EOF
   fi
 fi
 
+# ── 3c. 若存在 JoyCode（基于 Codex CLI 的公司内部工具），注册到 ~/.joycode/config.toml ──
+# JoyCode 没有 `mcp add` 子命令，配置格式同 Codex。这里原位 upsert 而非删了重加：
+# 只改 command/args,保留用户在该 server 下配的 tools.*.approval_mode 等子表。
+JOYCODE_HOME="${JOYCODE_HOME:-$HOME/.joycode}"
+JOYCODE_CFG="$JOYCODE_HOME/config.toml"
+if [ -f "$JOYCODE_CFG" ]; then
+  echo "==> 检测到 JoyCode，注册 MCP Server '$MCP_NAME' 到 $JOYCODE_CFG…"
+  if "$NODE_BIN" - "$JOYCODE_CFG" "$MCP_NAME" "$NODE_BIN" "$BRIDGE" <<'JS'
+const fs = require('fs');
+const [cfg, name, nodeBin, bridge] = process.argv.slice(2);
+const q = (s) => JSON.stringify(s); // JSON 字符串转义与 TOML basic string 兼容
+const orig = fs.readFileSync(cfg, 'utf8');
+const lines = orig.split('\n');
+const isHeader = (l) => /^\s*\[/.test(l);
+// 表头比较时去尾注释、空格和引号,兼容 [mcp_servers."browser-link-tool"] # xx 写法
+const norm = (l) => l.trim().replace(/\]\s*#.*$/, ']').replace(/[\s"']/g, '');
+const findTable = (h) => lines.findIndex((l) => norm(l) === h);
+function setKey(table, key, value) {
+  const h = `[${table}]`;
+  let i = findTable(h);
+  if (i < 0) {
+    if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
+    lines.push(h, '');
+    i = lines.length - 2;
+  }
+  let end = i + 1;
+  while (end < lines.length && !isHeader(lines[end])) end++;
+  const re = new RegExp(`^\\s*${key}\\s*=`);
+  for (let j = i + 1; j < end; j++) {
+    if (!re.test(lines[j])) continue;
+    let k = j; // 多行数组:吃到闭合 ]
+    if (/=\s*\[/.test(lines[j]) && !lines[j].includes(']')) while (k < end - 1 && !lines[k].includes(']')) k++;
+    lines.splice(j, k - j + 1, `${key} = ${value}`);
+    return;
+  }
+  let at = end; // 无此键:插到表体末尾(跳过尾部空行),保持键顺序
+  while (at > i + 1 && lines[at - 1].trim() === '') at--;
+  lines.splice(at, 0, `${key} = ${value}`);
+}
+setKey(`mcp_servers.${name}`, 'command', q(nodeBin));
+setKey(`mcp_servers.${name}`, 'args', `[ ${q(bridge)} ]`);
+// 不写 env.BRIDGE_CLIENT:面板名以 MCP 握手 clientInfo 为准,BRIDGE_CLIENT 只是无 clientInfo 时的兜底
+const next = lines.join('\n');
+if (next === orig) { console.log('   ✔ 已是最新，无需修改'); process.exit(0); }
+const bak = `${cfg}.bak.browser-link-${Date.now()}`;
+fs.copyFileSync(cfg, bak);
+fs.writeFileSync(cfg, next);
+console.log(`   ✔ 已注册到 JoyCode（command: ${nodeBin} ${bridge}；原配置备份 ${bak}）`);
+JS
+  then
+    echo "   ⚠ JoyCode 运行中需重启（或新开会话）才加载新配置"
+  else
+    echo "!! 写入 JoyCode 配置失败，请手动在 $JOYCODE_CFG 追加：" >&2
+    cat <<EOF >&2
+  [mcp_servers.$MCP_NAME]
+  command = "$NODE_BIN"
+  args = ["$BRIDGE"]
+EOF
+  fi
+elif [ -d "$JOYCODE_HOME" ]; then
+  echo "!! 检测到 $JOYCODE_HOME 但无 config.toml，请先启动一次 JoyCode 再重跑本脚本"
+fi
+
+# ── 3d. 让运行中的 bridge 换上本版代码 ─────────────────────────
+# daemon 模型:请 daemon 退出即可,各会话 client 下次心跳/调用会按磁盘上的新脚本重拉,会话不受影响。
+# 旧"主实例"模型(/health 无 mode:daemon):主实例不认 /shutdown,只有它所在的 agent 会话关闭才释放端口;
+# 而旧代理进程只认 status:"primary",把新 daemon 判成「端口被占用」→ 只能全部结束,让 agent 会话重开。
+HTTP_PORT="${BRIDGE_HTTP_PORT:-48766}"
+BRIDGE_STATE="$("$NODE_BIN" -e '
+fetch(`http://127.0.0.1:${process.argv[1]}/health`, { signal: AbortSignal.timeout(2000) })
+  .then(r => r.json().catch(() => ({})))
+  .then(j => console.log(j.service !== "browser-link-tool" ? "foreign" : j.mode === "daemon" ? "daemon" : "legacy"))
+  .catch(() => console.log("none"));
+' "$HTTP_PORT" 2>/dev/null || echo none)"
+case "$BRIDGE_STATE" in
+  daemon)
+    echo "==> 重启常驻 daemon 以加载新版…"
+    "$NODE_BIN" -e '
+fetch(`http://127.0.0.1:${process.argv[1]}/shutdown`, { method: "POST", signal: AbortSignal.timeout(2000) }).catch(() => {});
+' "$HTTP_PORT" 2>/dev/null || true
+    echo "   ✔ 已重启 daemon（各 agent 会话下次调用自动换上新版，无需重开）"
+    ;;
+  legacy)
+    echo "==> 检测到旧版 bridge（agent 拉起的主实例模型），结束全部旧进程以切换到常驻 daemon…"
+    if command -v pkill >/dev/null 2>&1; then
+      OLD_COUNT="$( (pgrep -f 'mcp-server-bridge\.mjs' 2>/dev/null || true) | wc -l | tr -d ' ')"
+      pkill -f 'mcp-server-bridge\.mjs' 2>/dev/null || true
+      # npx 拉起的旧版命令行里不含 mcp-server-bridge.mjs,按监听端口补刀
+      if command -v lsof >/dev/null 2>&1; then
+        lsof -ti "tcp:$HTTP_PORT" -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null || true
+      fi
+      echo "   ✔ 已结束旧版 bridge 进程 ${OLD_COUNT} 个"
+      echo "   ⚠ 需重开会话：已开着的 agent 会话（Claude Code / Codex / JoyCode 等）请重开，或在会话里 /mcp 重连 browser-link-tool"
+    else
+      echo "!! 本机无 pkill，请先关闭所有 agent 会话（或在任务管理器结束 node 的 mcp-server-bridge 进程）后再开" >&2
+    fi
+    ;;
+  foreign)
+    echo "!! 端口 $HTTP_PORT 被其他程序占用，browser-link-tool 无法启动；用 lsof -i :$HTTP_PORT 查看占用者" >&2
+    ;;
+esac
+
 # ── 4. 安装 Skill（Claude Code / Codex / Gemini / JoyCode / .agents，客户端配置根存在才铺）──
-if [ -x "$SCRIPT_DIR/sync-skills-local.sh" ]; then
+if [ -x "$SCRIPT_DIR/scripts/sync-skills-local.sh" ]; then
   echo "==> 安装 Skill…"
-  "$SCRIPT_DIR/sync-skills-local.sh" || true
+  "$SCRIPT_DIR/scripts/sync-skills-local.sh" || true
 fi
 
 # ── 5. 加载扩展指引 ───────────────────────────────────────

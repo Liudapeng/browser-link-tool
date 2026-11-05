@@ -1,6 +1,22 @@
 let socket = null;
 let reconnectTimer = null;
 
+// 扩展代码加载时刻 = 当前运行代码的"出厂时间";daemon 拿它和磁盘源码 mtime 比,判出"改了代码但没重载"。
+// 不能用 SW 启动时刻:扩展 SW 空闲挂起后再启动,跑的仍是扩展加载时注册的那份脚本(不重读磁盘),
+// 拿 SW 启动时刻比,SW 一重启旧代码就被误判成"已是最新"。storage.session 在扩展重载/更新、浏览器重启时清空,
+// SW 重启时保留,故"首次写入的值"恰是代码加载时刻。即便某版 Chrome 真会重读磁盘,本法最坏也只是多报一次"请重载",不会漏报。
+const CODE_LOADED_AT = (async () => {
+  try {
+    const { codeLoadedAt } = await chrome.storage.session.get('codeLoadedAt');
+    if (codeLoadedAt) return codeLoadedAt;
+    const now = Date.now();
+    await chrome.storage.session.set({ codeLoadedAt: now });
+    return now;
+  } catch (e) {
+    return Date.now();
+  }
+})();
+
 // ─── 注册 Arthas WebSocket hook(document_start / MAIN world)──────────
 // 必须在页面建立 WebSocket 之前注入,故用 document_start。注册后已打开的页面需刷新一次才生效。
 async function registerArthasHook() {
@@ -26,7 +42,7 @@ chrome.runtime.onStartup.addListener(registerArthasHook);
 registerArthasHook();
 
 
-// ─── 目标 Tab 解析：tabId > urlMatch > 活动 tab ───
+// ─── 目标 Tab 解析：tabId > url_match > 活动 tab ───
 async function getActiveTab() {
   let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tabs || tabs.length === 0) {
@@ -116,8 +132,8 @@ async function resolveTabInner(msg) {
     } catch (e) { /* fall through */ }
     throw new Error(`Tab ${msg.tabId} not found`);
   }
-  if (msg && msg.urlMatch != null || msg && msg.url_match != null) {
-    const targetUrl = msg.urlMatch != null ? msg.urlMatch : msg.url_match;
+  if (msg && msg.url_match != null) {
+    const targetUrl = msg.url_match;
     const tabs = await chrome.tabs.query({});
     const hit = tabs.find(t => t.url && t.url.includes(targetUrl));
     if (hit) { await setBinding(sid, hit.id); return hit; }
@@ -420,6 +436,52 @@ async function downloadUrlToDisk(url, filename, timeoutMs) {
   return { path, downloadId };
 }
 
+// ─── 浏览器身份:多浏览器(Chrome/Edge/多 profile)同时连 daemon 时,靠它区分与定向 ───
+// browserId 按 profile 持久化(storage.local 天然 per-profile);别名 browserAlias 可在 popup 改
+function detectBrand() {
+  const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+  const hit = brands.map(b => b.brand).find(b => /Edge|Chrome|Brave|Opera|Vivaldi|Arc/i.test(b) && !/Chromium/i.test(b));
+  if (hit) return hit.replace(/^Microsoft\s+/, '').replace(/^Google\s+/, '');
+  const ua = navigator.userAgent;
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/OPR\//.test(ua)) return 'Opera';
+  return 'Chrome';
+}
+async function getBrowserIdentity() {
+  const { browserId, browserAlias } = await chrome.storage.local.get(['browserId', 'browserAlias']);
+  let id = browserId;
+  if (!id) {
+    id = Math.random().toString(36).slice(2, 8);
+    await chrome.storage.local.set({ browserId: id });
+  }
+  const brand = detectBrand();
+  // manifest 取的是【加载时快照】:改了磁盘文件但没点重载,这里仍是旧值,正好用来识别"忘了重载"
+  const mf = chrome.runtime.getManifest();
+  return {
+    browserId: id, brand, name: (browserAlias && String(browserAlias).trim()) || `${brand}-${id}`,
+    extVersion: mf.version || '0.0.0',
+    extVersionName: mf.version_name || mf.version || '',
+    codeLoadedAt: await CODE_LOADED_AT,
+  };
+}
+async function sendHello() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  try {
+    const ident = await getBrowserIdentity();
+    let focused = false;
+    try { focused = !!(await chrome.windows.getLastFocused()).focused; } catch {}
+    socket.send(JSON.stringify({ type: 'hello', ...ident, focused }));
+  } catch (e) { console.warn('hello failed', e); }
+}
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'focus', focused: windowId !== chrome.windows.WINDOW_ID_NONE }));
+  }
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.browserAlias) sendHello();
+});
+
 function connect() {
   if (socket && socket.readyState !== WebSocket.CLOSED) return;
 
@@ -428,6 +490,7 @@ function connect() {
   socket.onopen = () => {
     console.log('MCP Bridge connected!');
     clearTimeout(reconnectTimer);
+    sendHello();
   };
 
   socket.onmessage = async (event) => {

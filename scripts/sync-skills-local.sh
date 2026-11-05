@@ -6,8 +6,9 @@
 set -euo pipefail
 
 MCP_NAME="browser-link-tool"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_SRC="$SCRIPT_DIR/skill/$MCP_NAME/SKILL.md"
+# 本脚本在 scripts/ 下,项目根是其上一级
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SKILL_SRC="$PROJECT_DIR/skill/$MCP_NAME/SKILL.md"
 
 [ -f "$SKILL_SRC" ] || { echo "[skill-sync] 源不存在: $SKILL_SRC" >&2; exit 1; }
 

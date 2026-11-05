@@ -7,34 +7,47 @@ import http from "http";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
+import os from "os";
+import { spawn, execFileSync } from "child_process";
 
-// ─── 多实例策略: 主实例 vs 代理实例 ───
-// 第一个进程成为"主实例"，拥有 WebSocket(:48765) + HTTP(:48766) 服务
-// 后续进程成为"代理实例"，通过 HTTP(:48766) 转发请求给主实例
-let isProxy = false;
+// ─── 进程模型: 单实例常驻 daemon + 每会话一个轻量 client ───
+// daemon(`--daemon`):全机唯一,独占 WebSocket(:48765,扩展连入、长连接) + HTTP(:48766);
+//   与任何 agent 会话解耦(detached 拉起),无 client 心跳超过 DAEMON_IDLE_MS 自退。
+// client(默认,agent 以 stdio 拉起):不占端口,每次工具调用都是一次临时 HTTP 请求转发给 daemon;
+//   启动时/调用时发现 daemon 不在就拉起一个,发现 daemon 版本比自己旧就让它退出后换新。
+const IS_DAEMON = process.argv.includes('--daemon');
 
-const WS_PORT = 48765;
-const HTTP_PORT = 48766;
-// ─── 会话标识与 client 识别(主/代理通用) ───
-// 每个 bridge 进程即一个 agent 会话。client 名的识别优先级:
-//   1) MCP 握手 clientInfo.name —— agent 在 initialize 时按协议自报,最权威(首次 callTool 时读取)
-//   2) 环境变量探测 —— 各 agent 拉起子进程时天然注入专属变量,作回退
-//   3) BRIDGE_CLIENT 环境变量 —— 用户显式指定,可强制覆盖上述
-//   4) 都拿不到 → 'unknown'
+// 端口可经环境变量覆盖,仅供本地测试(扩展固定连 48765,改了扩展就连不上)
+const WS_PORT = Number(process.env.BRIDGE_WS_PORT) || 48765;
+const HTTP_PORT = Number(process.env.BRIDGE_HTTP_PORT) || 48766;
+// 扩展断线后每 2s 重连一次;daemon 刚起时等扩展连上的最长时间
+const EXT_RECONNECT_WAIT_MS = 6000;
+// daemon 起来后此时长内扩展未连上视为"刚启动",调用方等待重连;超出则视为常态未连接、立即报错
+const DAEMON_FRESH_MS = 10000;
+// daemon 无任何 client 心跳/调用超过该时长自退(client 每 10s 心跳,agent 开着就不会退)
+const DAEMON_IDLE_MS = 10 * 60 * 1000;
+// daemon 日志(daemon 无终端,stdout/stderr 落文件);BRIDGE_HOME 可覆盖,供测试隔离
+const BRIDGE_HOME = process.env.BRIDGE_HOME || path.join(os.homedir(), '.browser-link-tool');
+const DAEMON_LOG = path.join(BRIDGE_HOME, 'daemon.log');
+// ─── 会话标识与 client 识别 ───
+// 每个 bridge 进程即一个 agent 会话。client 名以 MCP 握手 clientInfo(title || name)为准——协议标准、agent 真实自报:
+//   认得的品牌规范成展示名,认不出的原样展示 clientInfo 值(JoyCode 报 codex-mcp-client → 显示 Codex,接受)。
+//   只有握手前/没有 clientInfo 时才兜底:BRIDGE_CLIENT 环境变量 > 父进程链 > 环境变量探测 > 'unknown'。
 // 把 MCP 上报的原始 name(如 claude-code / cursor-vscode)规范成展示名。
 function normalizeClientName(raw) {
   if (!raw) return null;
   const s = String(raw).toLowerCase();
+  if (s.includes('joycode')) return 'JoyCode'; // 先于 codex:JoyCode 是 Codex 分支
   if (s.includes('claude')) return 'Claude';
   if (s.includes('codex')) return 'Codex';
   if (s.includes('gemini')) return 'Gemini';
   if (s.includes('cursor')) return 'Cursor';
   if (s.includes('cline')) return 'Cline';
   if (s.includes('windsurf')) return 'Windsurf';
-  // 未知但有名 → 原样展示(好过 unknown),但截断过长名避免撑爆面板
+  if (s.includes('antigravity')) return 'Antigravity';
+  // 认不出 → 原样展示 clientInfo 值(面板 CSS 省略号截断,悬停看全)
   const name = String(raw).trim();
-  if (!name) return null;
-  return name.length > 14 ? name.slice(0, 13) + '…' : name;
+  return name ? name.slice(0, 80) : null;
 }
 function detectClientFromEnv() {
   const e = process.env;
@@ -45,41 +58,142 @@ function detectClientFromEnv() {
   if (e.CURSOR_TRACE_ID || e.CURSOR_SESSION_ID) return 'Cursor';
   return 'unknown';
 }
+// 沿父进程链识别 agent(就近匹配)及其宿主(IDE/终端)。只在 client 启动时跑一次 ps(~30ms);Windows/无 ps 时返回空
+const PROC_AGENTS = [[/joycode/i, 'JoyCode'], [/claude/i, 'Claude'], [/gemini/i, 'Gemini'], [/codex/i, 'Codex'],
+  [/cursor/i, 'Cursor'], [/windsurf/i, 'Windsurf'], [/antigravity/i, 'Antigravity'], [/qoder/i, 'Qoder'],
+  [/\btrae\b/i, 'Trae'], [/kiro/i, 'Kiro'], [/opencode/i, 'OpenCode']];
+const PROC_HOSTS = [[/antigravity/i, 'Antigravity'], [/visual studio code|^code( helper)?/i, 'VSCode'], [/cursor/i, 'Cursor'],
+  [/windsurf/i, 'Windsurf'], [/intellij|idea|pycharm|goland|webstorm|jetbrains/i, 'JetBrains'], [/iterm/i, 'iTerm2'],
+  [/^terminal$/i, 'Terminal'], [/warp/i, 'Warp'], [/ghostty/i, 'Ghostty'], [/tmux/i, 'tmux'], [/joycode/i, 'JoyCode']];
+function detectClientFromProcess() {
+  if (process.platform === 'win32') return {};
+  try {
+    const procs = new Map();
+    for (const l of execFileSync('ps', ['-A', '-o', 'pid=,ppid=,comm='], { encoding: 'utf8', timeout: 2000 }).split('\n')) {
+      const m = l.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (m) procs.set(+m[1], { ppid: +m[2], comm: m[3] });
+    }
+    // 标签:macOS 的 comm 是可执行文件全路径,优先取所属 .app 包名(JoyCode 的 sidecar 叫 codex-app-server,靠包名才认得出);
+    // node/bun 等解释器跑的 CLI(npm 装的 claude/gemini)看 args 里的脚本路径
+    const label = (pid, comm) => {
+      const bundle = (comm.match(/\/([^/]+)\.app\//) || [])[1];
+      if (bundle) return bundle;
+      const base = path.basename(comm);
+      if (!/^(node|bun|deno|python3?)$/i.test(base)) return base;
+      try { return execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 1000 }).trim().split(/\s+/).slice(0, 3).join(' '); }
+      catch { return base; }
+    };
+    let agent = null;
+    let host = null;
+    let p = procs.get(process.pid)?.ppid;
+    for (let i = 0; i < 15 && p > 1 && procs.has(p) && !host; i++) {
+      const l = label(p, procs.get(p).comm);
+      if (!agent) {
+        const hit = PROC_AGENTS.find(([re]) => re.test(l));
+        if (hit) agent = hit[1];
+      } else {
+        const hit = PROC_HOSTS.find(([re]) => re.test(l));
+        if (hit && hit[1] !== agent) host = hit[1];
+      }
+      p = procs.get(p).ppid;
+    }
+    return { agent, host };
+  } catch { return {}; }
+}
+// 会话所在项目目录名(agent 一般以工作区为 cwd 拉起 MCP);在 home 或 / 时无意义,不报
+function detectProject() {
+  const cwd = process.cwd();
+  return (cwd === os.homedir() || cwd === '/') ? '' : path.basename(cwd);
+}
 const STARTED_AT = Date.now();
 const SESSION_ID = `${process.pid}-${STARTED_AT}`;
-const CLIENT_FORCED = (process.env.BRIDGE_CLIENT || '').trim(); // 用户显式覆盖(最高优先级)
-let BRIDGE_CLIENT = CLIENT_FORCED || detectClientFromEnv(); // 初值走环境;首次 callTool 会尝试用 clientInfo 升级
+const PROC_CLIENT = IS_DAEMON ? {} : detectClientFromProcess(); // agent 仅作无 clientInfo 时兜底;host 供面板展示
+// 握手前的兜底名;握手后由 upgradeClientName 换成 clientInfo
+let BRIDGE_CLIENT = (process.env.BRIDGE_CLIENT || '').trim() || PROC_CLIENT.agent || detectClientFromEnv();
+const BRIDGE_PROJECT = IS_DAEMON ? '' : detectProject();
+// 会话身份头:随每次请求上报,daemon 据此维护会话表(面板展示)。header 只能 ASCII,中文目录名需编码
+const sessionHeaders = () => ({
+  'x-bridge-session': SESSION_ID,
+  'x-bridge-client': encodeURIComponent(BRIDGE_CLIENT),
+  'x-bridge-started': String(STARTED_AT),
+  'x-bridge-host': PROC_CLIENT.host || '',
+  'x-bridge-project': encodeURIComponent(BRIDGE_PROJECT),
+  'x-bridge-client-info': encodeURIComponent(CLIENT_INFO), // 握手原始 clientInfo,仅供面板悬停排查
+});
+let CLIENT_INFO = ''; // 握手后填 "name/version"(如 JoyCode 报的是 codex-mcp-client/0.162.1)
 const SESSION_STALE_MS = 25 * 1000; // 心跳容差:超过此时长无心跳/调用视为离线,从清单移除(=2.5个心跳周期)
-const HEARTBEAT_MS = 10 * 1000;     // PROXY 心跳间隔:定时上报在线
+const HEARTBEAT_MS = 10 * 1000;     // client 心跳间隔:定时上报在线
 const ACTIVE_MS = 90 * 1000;        // 活跃阈值:此时长内有真实工具调用→绿点,否则灰点(连着但空闲)
-// 代理实例(每个 agent 会话拉起的转发进程)空闲超时：无工具调用超过该时长则自动退出，
-// 避免会话不断开导致进程堆积。主实例(连浏览器 WS)不自动退，退出会断开浏览器连接。
-const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 // 扩展源码在同级 ../extension，热更新监听该目录
 const BRIDGE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const EXTENSION_DIR = path.resolve(BRIDGE_DIR, "..", "extension");
+// 版本 + 构建戳(脚本 mtime):client 据此判断 daemon 是否比自己旧。二元组全序比较,不会两版互踢。
+const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRIDGE_DIR, 'package.json'), 'utf8')).version || '0.0.0'; } catch { return '0.0.0'; } })();
+const BUILD = (() => { try { return Math.floor(fs.statSync(SCRIPT_PATH).mtimeMs); } catch { return 0; } })();
+
+// ─── 版本一致性:桥 / 扩展 / skill 三端是否同代 ───
+// 升级链路最大的坑不是"升级失败",而是"只升了一半却毫不知情":改完 bridge 忘了在浏览器点重载,
+// 于是新桥调旧扩展,症状是"某个新工具报 unknown action"之类的怪事。下面几个函数把这种半升级状态显式化。
+
+// 磁盘上扩展源码的最新改动时间(仅开发态有 extension/ 目录;npm 包里没有,返回 0 表示不可判)
+let extMtimeCache = { at: 0, value: 0 };
+function extDiskMtime() {
+  if (Date.now() - extMtimeCache.at < 2000) return extMtimeCache.value; // 2s 缓存:/health 可能被高频轮询
+  let max = 0;
+  try {
+    for (const f of fs.readdirSync(EXTENSION_DIR)) {
+      if (!/\.(js|html|css|json)$/.test(f)) continue;
+      try { max = Math.max(max, Math.floor(fs.statSync(path.join(EXTENSION_DIR, f)).mtimeMs)); } catch {}
+    }
+  } catch { max = 0; }
+  extMtimeCache = { at: Date.now(), value: max };
+  return max;
+}
+
+// 判定单个已连浏览器与本桥是否同代。返回 { state, detail }:
+//   ok              两端同版本、且扩展跑的是磁盘上的最新代码
+//   version-mismatch 扩展版本号与桥不一致 → 必须重载扩展(或桥没升上去)
+//   stale-code      版本号一致,但磁盘源码比扩展实例新 → 改完代码忘了点重载
+//   unknown         扩展太旧,hello 里压根没带版本字段 → 一定要重载
+function browserVersionState(b) {
+  if (!b.extVersion) return { state: 'unknown', detail: '扩展未上报版本(属 1.5.x 及更早),请重载扩展' };
+  if (b.extVersion !== VERSION) {
+    return { state: 'version-mismatch', detail: `扩展 v${b.extVersion} ≠ 桥 v${VERSION},请在 chrome://extensions 重载扩展` };
+  }
+  const disk = extDiskMtime();
+  // 开发态(能看到磁盘源码)下没报加载时刻 = 扩展跑的是加此字段之前的代码,按 stale 报,别默认放行成 ok
+  if (disk && !b.codeLoadedAt) {
+    return { state: 'stale-code', detail: '扩展实例早于当前源码(未上报加载时刻),请在 chrome://extensions 重载扩展' };
+  }
+  if (disk && disk > b.codeLoadedAt) {
+    const mins = Math.round((disk - b.codeLoadedAt) / 60000);
+    const lag = mins >= 1 ? `比磁盘源码旧 ${mins} 分钟` : '比磁盘源码旧';
+    return { state: 'stale-code', detail: `扩展实例${lag}(源码改动后没重载),请在 chrome://extensions 重载扩展` };
+  }
+  return { state: 'ok', detail: `扩展 v${b.extVersion} 与桥同代` };
+}
 
 // ─── tab 定向入参 schema 片段（工具级复用） ───
+const BROWSER_PROP = {
+  browser: { type: "string", description: "可选，多浏览器(Chrome/Edge/多个 profile)同时连接时指定目标浏览器：填 list_tabs 返回的 browser 值(或其名称片段，如 \"edge\")。缺省按 本会话上次用的浏览器 > 唯一已连浏览器 > 最近获得焦点的浏览器；带 tabId 时须与之同属一个浏览器" }
+};
 const TAB_TARGET_PROPS = {
   tabId: { type: "number", description: "可选，目标标签页 ID（多会话隔离时指定，优先级最高）。缺省时按 url_match 或当前活动 tab" },
-  url_match: { type: "string", description: "可选，按 URL 子串匹配目标标签页。tabId 缺省时生效" }
+  url_match: { type: "string", description: "可选，按 URL 子串匹配目标标签页。tabId 缺省时生效" },
+  ...BROWSER_PROP
 };
 
-// ─── Proxy 模式工具函数 ───
-function proxyHttpRequest(urlPath, method = 'GET', body = null) {
+// ─── client → daemon 的 HTTP 转发(每次一个临时请求) ───
+function proxyHttpRequest(urlPath, method = 'GET', body = null, timeout = 120000, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: '127.0.0.1',
       port: HTTP_PORT,
       path: urlPath,
       method,
-      timeout: 120000,
-      headers: {
-        // 会话身份随每次转发上报,PRIMARY 据此维护活跃会话表(供面板展示)
-        'x-bridge-session': SESSION_ID,
-        'x-bridge-client': BRIDGE_CLIENT,
-        'x-bridge-started': String(STARTED_AT),
-      },
+      timeout,
+      headers: { ...sessionHeaders(), ...extraHeaders },
     };
     const req = http.request(options, (res) => {
       let data = '';
@@ -152,9 +266,14 @@ const TOOL_DEFINITIONS = [
     }
   },
   {
-    name: "mcp_browser_list_tabs",
-    description: "列出浏览器中所有打开的标签页（tabId/title/url/active/windowId）。用于多会话场景先获取 tabId 再定向操作。",
+    name: "mcp_browser_connection_info",
+    description: "只读诊断:返回桥(daemon/client)、各已连浏览器扩展、各客户端 skill 副本的版本与同代结论(verdict/problems),不操作任何页面。升级后确认是否生效、或工具行为诡异疑似版本不一致时先跑它。扩展没连上时同样可用。",
     inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "mcp_browser_list_tabs",
+    description: "列出浏览器中所有打开的标签页（tabId/title/url/active/windowId）。用于多会话场景先获取 tabId 再定向操作。多个浏览器同时连接时，缺省列出全部浏览器的标签页，每项多带 browser/browserName 字段(后续调用把 browser 原样传回)；传 browser 只列该浏览器。",
+    inputSchema: { type: "object", properties: { ...BROWSER_PROP } }
   },
   {
     name: "mcp_browser_activate_tab",
@@ -428,16 +547,13 @@ const TOOL_DEFINITIONS = [
   }
 ];
 
-// ─── 工具 → HTTP 路由 + 载荷映射（主/代理共用） ───
+// ─── 工具 → HTTP 路由 + 载荷映射 ───
 // bodyFn 接收 args，返回请求体字符串（GET 返回 null）
 function pickTabTargets(args) {
   const t = {};
   if (args.tabId != null) t.tabId = args.tabId;
-  const um = args.url_match != null ? args.url_match : args.urlMatch;
-  if (um != null) {
-    t.url_match = um;
-    t.urlMatch = um; // 双字段下发，兼容新老版本扩展 background.js
-  }
+  if (args.url_match != null) t.url_match = args.url_match;
+  if (args.browser != null && String(args.browser).trim()) t.browser = String(args.browser).trim(); // daemon 消费,不下发扩展
   return t;
 }
 
@@ -447,7 +563,7 @@ const TOOL_ROUTES = {
   mcp_browser_click: { path: '/click', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, ...pickTabTargets(a) }) },
   mcp_browser_fill: { path: '/fill', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, value: a.value, ...pickTabTargets(a) }) },
   mcp_browser_navigate: { path: '/navigate', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url, ...pickTabTargets(a) }) },
-  mcp_browser_list_tabs: { path: '/list_tabs', method: 'POST', bodyFn: () => '{}' },
+  mcp_browser_list_tabs: { path: '/list_tabs', method: 'POST', bodyFn: (a) => JSON.stringify(pickTabTargets({ browser: a.browser })) },
   mcp_browser_activate_tab: { path: '/activate_tab', method: 'POST', bodyFn: (a) => JSON.stringify(pickTabTargets(a)) },
   mcp_browser_wait_for: { path: '/wait_for', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, text: a.text, visible: a.visible, timeout: a.timeout, ...pickTabTargets(a) }) },
   mcp_browser_get_storage: { path: '/get_storage', method: 'POST', bodyFn: (a) => JSON.stringify({ storageType: a.storageType, key: a.key, ...pickTabTargets(a) }) },
@@ -504,44 +620,47 @@ const HTTP_ACTION_MAP = {
   '/get_current_tab': 'get_current_tab',
 };
 
-// ─── 主动探活:已有健康主实例？ ───
+// ─── 读 daemon /health(daemon 启动探活与 client 调用前校验共用) ───
 // macOS 双栈下 IPv6/IPv4 同端口不报 EADDRINUSE，盲听会裂脑；启动前先探活兜底。
 // 用内置 http 模块而非 fetch，兼容 Node 16(fetch/AbortSignal.timeout 在 16 不可用)。
-// 返回:'primary'=本工具主实例就位 | 'foreign'=端口被陌生服务占用 | 'none'=无人应答
-function probePrimaryHealth() {
+// 短超时:daemon 挂起(如被 SIGSTOP)时快速失败,别让每次调用卡 120s。
+// 返回 { state, health }:state='daemon'=本工具 daemon 就位 | 'foreign'=端口被陌生服务占用 | 'none'=无人应答/超时
+function fetchHealth(timeout = 1500) {
   return new Promise((resolve) => {
+    const done = (state, health = null) => resolve({ state, health });
     const req = http.request(
-      { hostname: '127.0.0.1', port: HTTP_PORT, path: '/health', method: 'GET', timeout: 800 },
+      { hostname: '127.0.0.1', port: HTTP_PORT, path: '/health', method: 'GET', timeout,
+        headers: sessionHeaders() },
       (res) => {
         let data = '';
         res.on('data', (c) => {
           data += c;
           // 探活响应本应很小；陌生服务撞端口回超大 body 时截断防吃内存
-          if (data.length > 65536) { res.destroy(); resolve('foreign'); }
+          if (data.length > 65536) { res.destroy(); done('foreign'); }
         });
         res.on('end', () => {
-          if (res.statusCode !== 200) { resolve('foreign'); return; }
+          if (res.statusCode !== 200) { done('foreign'); return; }
           try {
             const j = JSON.parse(data);
             // 指纹 + 端口双校验，确认对端确是本工具而非撞端口的陌生服务
-            if (j.service === 'browser-link-tool' && j.status === 'primary'
-                && j.wsPort === WS_PORT && j.httpPort === HTTP_PORT) {
-              resolve('primary');
+            // 指纹只认 service+端口这类永不改的字段:多认一个字段,将来该字段一改,旧 client 就会把新 daemon 当外人
+            if (j.service === 'browser-link-tool' && j.wsPort === WS_PORT && j.httpPort === HTTP_PORT) {
+              done('daemon', j);
             } else {
-              resolve('foreign'); // 有人应答但不是本工具
+              done('foreign'); // 有人应答但不是本工具
             }
-          } catch { resolve('foreign'); }
+          } catch { done('foreign'); }
         });
       }
     );
-    req.on('error', () => resolve('none')); // 拒连=端口空闲
-    req.on('timeout', () => { req.destroy(); resolve('none'); });
+    req.on('error', () => done('none')); // 拒连=端口空闲
+    req.on('timeout', () => { req.destroy(); done('none'); });
     req.end();
   });
 }
 
-// ─── 原子绑定:WS(48765) 与 HTTP(48766) 全绑成功才算主实例 ───
-// 任一端口失败 → 回滚关闭已绑 server，降级 PROXY，绝不 process.exit。
+// ─── 原子绑定:WS(48765) 与 HTTP(48766) 全绑成功才算 daemon 就位 ───
+// 任一端口失败 → 回滚关闭已绑 server,daemon 退出让先到者当家,绝不半绑。
 function bindPortAtomic(server, port) {
   return new Promise((resolve) => {
     const onError = () => resolve(false); // EADDRINUSE 等一律降级
@@ -553,9 +672,9 @@ function bindPortAtomic(server, port) {
   });
 }
 
-// ─── 主实例完整逻辑 ───
-// wssHttpServer(48765)、httpServer(48766) 均已由 tryStartPrimary 原子绑定成功后传入。
-function setupPrimaryInstance(wssHttpServer, httpServer) {
+// ─── daemon 完整逻辑 ───
+// wssHttpServer(48765)、httpServer(48766) 均已由 bindDaemonPorts 原子绑定成功后传入。
+function setupDaemon(wssHttpServer, httpServer, onShutdown) {
   // maxPayload 提到 512MB:大页面 snapshot / eval 大对象可能超 ws 默认 100MB 上限，
   // 否则会触发 1009 错误。配合下方 ws.on('error') 兜底，双重防崩。
   const wss = new WebSocketServer({ server: wssHttpServer, maxPayload: 512 * 1024 * 1024 });
@@ -565,29 +684,86 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
   wssHttpServer.on('error', (err) => console.error(`[bridge] WS server runtime error: ${err.message}`));
   httpServer.on('error', (err) => console.error(`[bridge] HTTP server runtime error: ${err.message}`));
 
-  let activeClient = null;
-  let pendingRequests = new Map();
+  const daemonSince = Date.now();
+  const pendingRequests = new Map(); // msgId -> { resolve, entry }
   let currentId = 1;
 
-  // ─── 会话表:sessionId -> {client, pid, mode, startedAt, lastSeen, lastCallAt, calls} ───
+  // ─── 浏览器注册表:每个扩展连接一条,Chrome/Edge/多个 profile 可同时在线 ───
+  // key=browserId:扩展 hello 上报的 per-profile 持久随机 id(未 hello 的连接不登记)。
+  const browsers = new Map();       // id -> { id, name, brand, ws, connectedAt, focused, lastFocusAt }
+  const sessionBrowser = new Map(); // sessionId -> browserId:会话粘在上次用的浏览器(同扩展侧"会话粘 tab")
+  // sessionId -> Map(tabId -> [browserId]):该会话最近一次合并 list_tabs 的结果。各浏览器 tabId 独立编号会撞号,
+  // 带 tabId 不带 browser 时按它路由;撞号则报歧义让调用方补 browser,绝不猜
+  const sessionTabIndex = new Map();
+  const liveBrowsers = () => [...browsers.values()].filter(b => b.ws.readyState === 1);
+  const sanitizeId = (s) => String(s || '').replace(/[^\w-]/g, '').slice(0, 32);
+
+  // 显式 browser 参数:id/名称精确匹配优先,再按名称/品牌片段唯一匹配
+  function matchBrowser(sel) {
+    const live = liveBrowsers();
+    const s = String(sel).toLowerCase();
+    const exact = live.filter(b => b.id.toLowerCase() === s || b.name.toLowerCase() === s);
+    if (exact.length === 1) return { b: exact[0] };
+    const fuzzy = live.filter(b => b.name.toLowerCase().includes(s) || b.brand.toLowerCase().includes(s));
+    if (fuzzy.length === 1) return { b: fuzzy[0] };
+    const list = (fuzzy.length ? fuzzy : live).map(b => `${b.id}(${b.name})`).join(', ') || 'none';
+    return { error: fuzzy.length ? `browser "${sel}" is ambiguous, matches: ${list}` : `browser "${sel}" not connected; connected browsers: ${list}` };
+  }
+  // 缺省选择顺序:本会话上次用的 > 当前有焦点 > 最近获得焦点 > 最近连上
+  function rankedBrowsers(sid) {
+    const live = liveBrowsers().sort((a, b) =>
+      (b.focused - a.focused) || (b.lastFocusAt - a.lastFocusAt) || (b.connectedAt - a.connectedAt));
+    const bound = live.find(b => b.id === sessionBrowser.get(sid));
+    return bound ? [bound, ...live.filter(b => b !== bound)] : live;
+  }
+  const TAB_NOT_FOUND_RE = /Tab \S+ not found|No tab matching url|No tab with id/;
+
+  function actionTimeout(action, payload) {
+    if (action === 'scrolling_screenshot') return 120000;
+    if (action === 'wait_for' || action === 'js_grep') return 65000;
+    if (action === 'arthas_exec') return Math.max((payload.timeout || 60000) + 5000, 65000);
+    if (action === 'download') return Math.max((payload.timeoutMs || 60000) + 5000, 65000);
+    return 15000;
+  }
+  // 向某个浏览器下发一条 action,resolve 扩展回包(超时/断连也 resolve 成 {error},不 reject)
+  function dispatch(b, action, payload, sid) {
+    return new Promise((resolve) => {
+      const id = currentId++;
+      const timer = setTimeout(() => {
+        if (pendingRequests.delete(id)) resolve({ error: "Request timed out", __status: 504 });
+      }, actionTimeout(action, payload));
+      pendingRequests.set(id, { entry: b, resolve: (r) => { clearTimeout(timer); resolve(r); } });
+      // __session 随 action 下发扩展,供扩展按会话维度绑定/解析目标 tab(每会话独立)
+      try { b.ws.send(JSON.stringify({ action, id, __session: sid, ...payload })); }
+      catch (e) { pendingRequests.delete(id); clearTimeout(timer); resolve({ error: `send to ${b.id} failed: ${e.message}`, __status: 503 }); }
+    });
+  }
+
+  // ─── 会话表:sessionId -> {client, pid, startedAt, lastSeen, lastCallAt, calls} ───
   // lastSeen=最近任意上报(含心跳)→ 判在线;lastCallAt=最近真实工具调用 → 判活跃(绿/灰)。
+  // daemon 自身不是 agent 会话,不入表;只登记各 client。
   const sessions = new Map();
-  sessions.set(SESSION_ID, {
-    client: BRIDGE_CLIENT, pid: process.pid, mode: 'primary',
-    startedAt: STARTED_AT, lastSeen: Date.now(), lastCallAt: 0, calls: 0,
-  });
+  let lastClientSeenAt = Date.now(); // 供 daemon 空闲自退判断
   // 读请求 header 更新会话表。countCall=true 时累加调用次数并刷新 lastCallAt(仅业务路由;health/ping 不计)。
   const touchSession = (req, countCall) => {
     const sid = req.headers['x-bridge-session'];
     if (!sid) return;
     const now = Date.now();
-    // client 统一规范化(claude-code→Claude 等),避免主/代理显示不一致
-    const clientRaw = req.headers['x-bridge-client'];
-    const client = normalizeClientName(clientRaw); // 可能为 null(空串/无法识别)
+    lastClientSeenAt = now;
+    // client 名规范化(claude-code→Claude 等);client 对原值 URI 编码(clientInfo 可能含中文)
+    const dec = (h) => { try { return decodeURIComponent(String(req.headers[h] || '')).slice(0, 80) || null; } catch { return null; } };
+    const clientRaw = dec('x-bridge-client');
+    const client = clientRaw === 'unknown' ? null : normalizeClientName(clientRaw); // null = 无有效名
+    const host = dec('x-bridge-host');
+    const project = dec('x-bridge-project');
+    const clientInfo = dec('x-bridge-client-info');
     const prev = sessions.get(sid);
     if (prev) {
       prev.lastSeen = now;
       if (client) prev.client = client; // 仅在拿到有效名时覆盖,避免把已升级的名打回 unknown
+      if (host) prev.host = host;
+      if (project) prev.project = project;
+      if (clientInfo) prev.clientInfo = clientInfo;
       if (countCall) { prev.calls++; prev.lastCallAt = now; }
     } else {
       // startedAt 合理性校验:非法/未来/超 30 天前一律回退 now,防面板显示错乱的接入时长
@@ -595,8 +771,10 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       const startedAt = (Number.isFinite(raw) && raw <= now && raw >= now - 30 * 86400 * 1000) ? raw : now;
       sessions.set(sid, {
         client,
+        host,
+        project,
+        clientInfo,
         pid: Number(String(sid).split('-')[0]) || 0,
-        mode: 'proxy',
         startedAt,
         lastSeen: now,
         lastCallAt: countCall ? now : 0,
@@ -607,41 +785,82 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
 
   httpServer.on('request', (req, res) => {
     const url = req.url;
-    // 每个请求登记会话在线;/health(popup轮询)和 /session_ping(心跳)不算"调用"
-    touchSession(req, url !== '/health' && url !== '/session_ping');
 
-    const handleBrowserAction = (action, extraPayload = {}) => {
-      if (!activeClient || activeClient.readyState !== 1) {
-        res.writeHead(503);
-        res.end(JSON.stringify({ error: "No Chrome Extension connected" }));
+    // 防网页跨站调用:任意网站都能向 127.0.0.1 发 no-cors POST(如 /eval 执行任意 JS、读 Cookie)。
+    // 浏览器发起的跨源 POST 必带 Origin;本工具 client 是 Node、不带 Origin;扩展 popup 只 GET /health。
+    // 故除 /health 外:必须 POST,且 Origin 若存在只认 chrome-extension://。
+    if (url !== '/health') {
+      const origin = req.headers.origin;
+      if (req.method !== 'POST' || (origin && !String(origin).startsWith('chrome-extension://'))) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Forbidden: browser-link-tool only accepts local POST from its own clients' }));
         return;
       }
-      const id = currentId++;
-      let timeoutMs;
-      if (action === 'scrolling_screenshot') timeoutMs = 120000;
-      else if (action === 'wait_for' || action === 'js_grep') timeoutMs = 65000;
-      else if (action === 'arthas_exec') timeoutMs = Math.max((extraPayload.timeout || 60000) + 5000, 65000);
-      else if (action === 'download') timeoutMs = Math.max((extraPayload.timeoutMs || 60000) + 5000, 65000);
-      else timeoutMs = 15000;
-      const timer = setTimeout(() => {
-        if (pendingRequests.has(id)) {
-          pendingRequests.delete(id);
-          res.writeHead(504);
-          res.end(JSON.stringify({ error: "Request timed out" }));
-        }
-      }, timeoutMs);
-      // __session 随 action 下发扩展,供扩展按会话维度绑定/解析目标 tab(每会话独立)
+    }
+
+    // 每个请求登记会话在线;/health(popup轮询)和 /session_ping(心跳)不算"调用"
+    touchSession(req, url !== '/health' && url !== '/session_ping' && url !== '/shutdown');
+
+    const handleBrowserAction = async (action, payload = {}) => {
+      const reply = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
       const sid = req.headers['x-bridge-session'] || SESSION_ID;
-      pendingRequests.set(id, (response) => {
-        clearTimeout(timer);
-        // 扩展回传本次实际操作的 tab → 更新会话表,面板显示真实 tab 而非笼统"活动标签页"
-        const rt = response && response.__resolvedTab;
-        const s = sessions.get(sid);
-        if (s && rt) { s.lastTabId = rt.tabId; s.lastTabTitle = rt.title || null; }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(response));
-      });
-      activeClient.send(JSON.stringify({ action, id, __session: sid, ...extraPayload }));
+      const { browser: sel, ...rest } = payload;
+      const live = liveBrowsers();
+      if (live.length === 0) return reply(503, { error: "No Chrome Extension connected" });
+      const multi = live.length > 1;
+      const s = sessions.get(sid);
+
+      let picked = null;
+      if (sel) {
+        const m = matchBrowser(sel);
+        if (m.error) return reply(200, { error: m.error });
+        picked = m.b;
+      }
+
+      // list_tabs 多浏览器且未指定:并发拉全部浏览器,每项标注所属浏览器
+      if (action === 'list_tabs' && multi && !picked) {
+        const all = [];
+        const errs = [];
+        await Promise.all(live.map(async (b) => {
+          const r = await dispatch(b, 'list_tabs', rest, sid);
+          if (r.error) { errs.push(`${b.id}: ${r.error}`); return; }
+          try { for (const t of JSON.parse(r.result)) all.push({ ...t, browser: b.id, browserName: b.name }); } catch {}
+        }));
+        if (!all.length && errs.length) return reply(200, { error: errs.join('; ') });
+        const idx = new Map();
+        for (const t of all) idx.set(t.tabId, [...(idx.get(t.tabId) || []), t.browser]);
+        sessionTabIndex.set(sid, idx);
+        return reply(200, { result: JSON.stringify(all) });
+      }
+
+      // 显式 tabId/url_match 但没指明浏览器、首选浏览器里找不到该 tab → 依次试其余浏览器
+      // (找不到 tab 时扩展在 resolveTab 阶段即报错、action 未执行,重试无副作用)
+      if (!picked && multi && rest.tabId != null) {
+        const owners = (sessionTabIndex.get(sid)?.get(Number(rest.tabId)) || []).filter(id => browsers.has(id));
+        if (owners.length > 1) return reply(200, { error: `tabId ${rest.tabId} exists in multiple browsers (${owners.join(', ')}); pass browser to disambiguate` });
+        if (owners.length === 1) picked = browsers.get(owners[0]);
+      }
+      const candidates = picked ? [picked] : rankedBrowsers(sid);
+      const retryable = !picked && multi && (rest.tabId != null || rest.url_match != null);
+      let b = null;
+      let r = null;
+      for (const cand of (retryable ? candidates : candidates.slice(0, 1))) {
+        b = cand;
+        r = await dispatch(b, action, rest, sid);
+        if (!(retryable && r && typeof r.error === 'string' && TAB_NOT_FOUND_RE.test(r.error))) break;
+      }
+      if (!(r && typeof r.error === 'string' && TAB_NOT_FOUND_RE.test(r.error))) sessionBrowser.set(sid, b.id);
+
+      if (action === 'list_tabs' && multi && r && r.result) {
+        try { r = { ...r, result: JSON.stringify(JSON.parse(r.result).map(t => ({ ...t, browser: b.id, browserName: b.name }))) }; } catch {}
+      }
+      // 扩展回传本次实际操作的 tab → 更新会话表,面板显示真实 tab 而非笼统"活动标签页"
+      const rt = r && r.__resolvedTab;
+      if (s && rt) { s.lastTabId = rt.tabId; s.lastTabTitle = rt.title || null; }
+      if (s) s.lastBrowser = multi ? b.name : null;
+      const status = (r && r.__status) || 200;
+      if (r) delete r.__status;
+      reply(status, r);
     };
 
     const readBody = (cb) => {
@@ -649,34 +868,51 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       req.on("data", chunk => body += chunk);
       req.on("end", () => {
         let parsed = {};
-        if (body) { try { parsed = JSON.parse(body); } catch (e) { parsed = { __raw: body }; } }
+        if (body) { try { parsed = JSON.parse(body); } catch (e) { parsed = {}; } }
         cb(parsed);
       });
     };
 
     if (url === "/session_ping") {
-      // PROXY 心跳:touchSession 已在入口刷新 lastSeen,这里直接回 200
+      // client 心跳:touchSession 已在入口刷新 lastSeen,这里直接回 200
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
       return;
     }
 
+    if (url === "/shutdown") {
+      // 新版 client 发现本 daemon 版本旧时请求退出,随后由它拉起新版;手动重启 daemon 也走这里。
+      // 带 x-bridge-target-pid 时只认自己:升级瞬间多个新 client 都读到旧 daemon 的 health,
+      // 晚到的 shutdown 会落到刚被拉起的新 daemon 上,不校验就把新 daemon 也踢掉了
+      const target = req.headers['x-bridge-target-pid'];
+      if (target && String(target) !== String(process.pid)) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `pid mismatch: target ${target}, self ${process.pid}` }));
+        return;
+      }
+      console.error(`[bridge] shutdown requested by session ${req.headers['x-bridge-session'] || '?'}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      setTimeout(() => onShutdown(), 50);
+      return;
+    }
+
     if (url === "/health") {
-      // popup 探活/PROXY 探活都打这里。若带会话 header 则刷新其活跃(PRIMARY 自身也靠此保活)
+      // popup 探活/client 探活都打这里。若带会话 header 则刷新其在线状态
       const now = Date.now();
-      const self = sessions.get(SESSION_ID);
-      if (self) { self.lastSeen = now; self.client = BRIDGE_CLIENT; } // client 名可能被 callTool 用 clientInfo 升级过
-      // 回收僵尸会话:超期的非 primary 条目直接从 Map 删除(否则退出的进程/外部客户端会永久累积 → 内存泄漏)
+      // 回收僵尸会话:超期条目直接从 Map 删除(否则退出的进程/外部客户端会永久累积 → 内存泄漏)
       for (const [sid, s] of sessions) {
-        if (s.mode !== 'primary' && now - s.lastSeen > SESSION_STALE_MS) sessions.delete(sid);
+        if (now - s.lastSeen > SESSION_STALE_MS) { sessions.delete(sid); sessionBrowser.delete(sid); sessionTabIndex.delete(sid); }
       }
       const onlineSessions = [...sessions.values()]
         .filter(s => now - s.lastSeen <= SESSION_STALE_MS) // 心跳在→在线清单
         .sort((a, b) => (b.lastCallAt || 0) - (a.lastCallAt || 0) || b.lastSeen - a.lastSeen)
         .map(s => ({
           client: s.client,
+          host: s.host || null,       // 宿主 IDE/终端(进程链识别)
+          project: s.project || null, // 会话所在项目目录名
+          clientInfo: s.clientInfo || null, // MCP 握手原始 name/version
           pid: s.pid,
-          mode: s.mode,
           uptimeMs: now - s.startedAt,
           idleMs: s.lastCallAt ? now - s.lastCallAt : null, // 距最近一次真实调用(null=从未调用)
           active: !!(s.lastCallAt && now - s.lastCallAt <= ACTIVE_MS), // 绿点判据
@@ -684,13 +920,29 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
           lastTool: s.lastTool || null,
           lastTabId: s.lastTabId != null ? s.lastTabId : null,
           lastTabTitle: s.lastTabTitle || null,
+          lastBrowser: s.lastBrowser || null, // 多浏览器在线时才有值
         }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         service: "browser-link-tool", // 指纹:供探活确认对端确是本工具而非撞端口的陌生服务
-        status: "primary",
-        mode: "primary",
-        connected: !!(activeClient && activeClient.readyState === 1),
+        mode: "daemon",
+        version: VERSION,
+        build: BUILD,
+        pid: process.pid,
+        connected: liveBrowsers().length > 0,
+        browsers: liveBrowsers().map(b => {
+          const vs = browserVersionState(b);
+          return {
+            id: b.id, name: b.name, brand: b.brand, focused: b.focused, connectedAt: b.connectedAt,
+            extVersion: b.extVersion || null,
+            extVersionName: b.extVersionName || null,
+            codeLoadedAt: b.codeLoadedAt || null,
+            versionState: vs.state,   // ok | version-mismatch | stale-code | unknown
+            versionDetail: vs.detail, // 人话结论,popup 与 connection_info 直接展示
+          };
+        }),
+        extDiskMtime: extDiskMtime(), // 0 = 非开发态(npm 包无 extension/ 目录),此时只比版本号
+        daemonSince, // daemon 就位时刻:调用方据此判断是否刚启动、值得等扩展重连
         wsPort: WS_PORT,
         httpPort: HTTP_PORT,
         sessions: onlineSessions,
@@ -714,24 +966,14 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
       // lastTabId/lastTabTitle 由扩展回传的 __resolvedTab 独家更新(真实操作的 tab,含活动 tab 场景)
     };
 
-    // GET 仅 /snapshot 兼容旧行为不再需要；统一按 POST 读 body
-    if (req.method === "POST") {
-      readBody((data) => {
-        recordOp(data);
-        // eval 旧协议兼容：body 可能是纯代码字符串
-        if (action === 'evaluate' && data.__raw != null) {
-          handleBrowserAction('evaluate', { code: data.__raw });
-          return;
-        }
-        handleBrowserAction(action, data);
-      });
-    } else {
-      recordOp({});
-      handleBrowserAction(action, {});
-    }
+    // 闸门已保证业务路由只有 POST 进来
+    readBody((data) => {
+      recordOp(data);
+      handleBrowserAction(action, data);
+    });
   });
 
-  console.error(`[bridge] PRIMARY mode: HTTP listening on 127.0.0.1:${HTTP_PORT}`);
+  console.error(`[bridge] DAEMON: HTTP listening on 127.0.0.1:${HTTP_PORT}`);
 
   // Hot Reload 文件监听
   let debounceTimer = null;
@@ -743,9 +985,9 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
           if (filename === 'background.js' || filename === 'mcp-server-bridge.mjs' || filename.startsWith('test')) return;
           clearTimeout(debounceTimer);
           debounceTimer = setTimeout(() => {
-            if (activeClient && activeClient.readyState === 1) {
-              console.log(`[Hot Reload] File ${filename} changed, sending reload signal...`);
-              activeClient.send(JSON.stringify({ action: "reload" }));
+            for (const b of liveBrowsers()) {
+              console.error(`[Hot Reload] File ${filename} changed, sending reload signal to ${b.id}...`);
+              b.ws.send(JSON.stringify({ action: "reload" }));
             }
           }, 500);
         }
@@ -754,33 +996,82 @@ function setupPrimaryInstance(wssHttpServer, httpServer) {
   }
 
   wss.on('connection', (ws) => {
-    activeClient = ws;
-    console.error('[bridge] Chrome Extension connected');
+    // 扩展连上即发 hello 上报 browserId;收到 hello 才登记进注册表,限时不发(非本扩展/版本过旧)直接断开
+    const entry = { id: null, name: null, brand: null, ws, connectedAt: Date.now(), focused: false, lastFocusAt: 0 };
+    const helloTimer = setTimeout(() => {
+      console.error('[bridge] WS client sent no hello within 5s, closing');
+      try { ws.close(1008, 'hello required'); } catch {}
+    }, 5000);
     // 每个连接必须挂 error 监听:否则 ws 抛错(如超大 payload 触发 1009)在实例上发 'error'
     // 事件而无监听器时，Node 会直接 throw 崩溃主进程、断开浏览器。
     ws.on('error', (e) => console.error(`[bridge] WS connection error: ${e.message}`));
     ws.on('message', (message) => {
-      try {
-        const data = JSON.parse(message.toString());
-        if (data.id && pendingRequests.has(data.id)) {
-          const resolve = pendingRequests.get(data.id);
-          resolve(data);
-          pendingRequests.delete(data.id);
+      let data;
+      try { data = JSON.parse(message.toString()); } catch (e) { return; }
+      if (data && data.type === 'hello') {
+        const newId = sanitizeId(data.browserId);
+        if (!newId) { try { ws.close(1008, 'invalid browserId'); } catch {} return; }
+        clearTimeout(helloTimer);
+        if (newId !== entry.id) {
+          const old = browsers.get(newId);
+          // 同一浏览器(扩展重载/SW 重启)的旧连接:让位给新连接
+          if (old && old.ws !== ws) { browsers.delete(newId); try { old.ws.close(); } catch {} }
+          if (entry.id) browsers.delete(entry.id);
+          entry.id = newId;
+          browsers.set(newId, entry);
         }
-      } catch (e) {}
+        entry.brand = String(data.brand || 'Chromium').slice(0, 32);
+        entry.name = String(data.name || `${entry.brand}-${entry.id}`).slice(0, 64);
+        // 版本三件套:扩展版本号 / 带 build 戳的展示名 / 扩展代码加载时刻(判"改了代码没重载")
+        entry.extVersion = data.extVersion ? String(data.extVersion).slice(0, 32) : null;
+        entry.extVersionName = data.extVersionName ? String(data.extVersionName).slice(0, 64) : null;
+        entry.codeLoadedAt = Number(data.codeLoadedAt) || 0;
+        if (data.focused != null) { entry.focused = !!data.focused; if (entry.focused) entry.lastFocusAt = Date.now(); }
+        const vs = browserVersionState(entry);
+        console.error(`[bridge] browser connected: ${entry.id} (${entry.name}, ext v${entry.extVersion || '?'}, bridge v${VERSION}, total ${liveBrowsers().length})`);
+        if (vs.state !== 'ok') console.error(`[bridge] ⚠ VERSION ${vs.state}: ${vs.detail}`);
+        return;
+      }
+      if (!entry.id) return; // hello 前的其它消息一律忽略
+      if (data && data.type === 'focus') {
+        entry.focused = !!data.focused;
+        if (entry.focused) {
+          entry.lastFocusAt = Date.now();
+          // 焦点互斥:一个浏览器拿到焦点,其他的必然失焦(失焦事件可能晚到或丢失)
+          for (const b of browsers.values()) if (b !== entry) b.focused = false;
+        }
+        return;
+      }
+      if (data && data.id && pendingRequests.has(data.id)) {
+        const p = pendingRequests.get(data.id);
+        pendingRequests.delete(data.id);
+        p.resolve(data);
+      }
     });
     ws.on('close', () => {
-      if (activeClient === ws) {
-        activeClient = null;
-        console.error('[bridge] Chrome Extension disconnected');
+      clearTimeout(helloTimer);
+      if (!entry.id) return; // 未 hello 的连接从未登记
+      if (browsers.get(entry.id) === entry) browsers.delete(entry.id);
+      // 该浏览器上的在途请求立即失败,别让调用方干等超时
+      for (const [id, p] of pendingRequests) {
+        if (p.entry === entry) {
+          pendingRequests.delete(id);
+          p.resolve({ error: `Chrome Extension (${entry.name}) disconnected during request`, __status: 503 });
+        }
       }
+      console.error(`[bridge] Chrome Extension disconnected (${entry.id}, remaining ${liveBrowsers().length})`);
     });
   });
 
-  return { wss, wssHttpServer, httpServer, debounceTimer };
+  return {
+    wss, wssHttpServer, httpServer,
+    getDebounceTimer: () => debounceTimer,
+    getLastClientSeenAt: () => lastClientSeenAt,
+    getPendingCount: () => pendingRequests.size,
+  };
 }
 
-// ─── 单屏截图（主/代理共用）───
+// ─── 单屏截图 ───
 async function runScrollingScreenshot(args) {
   const outputPath = args.output_path || `/tmp/screenshot_${Date.now()}.png`;
   const responseText = await proxyHttpRequest('/scrolling_screenshot', 'POST', JSON.stringify({
@@ -796,41 +1087,116 @@ async function runScrollingScreenshot(args) {
   return { content: [{ type: "text", text: `Screenshot saved to: ${outputPath}` }] };
 }
 
-// ─── 通用工具调用（主/代理统一走 HTTP :48766） ───
+// ─── client 名升级:握手后一律以 clientInfo 为准(覆盖 BRIDGE_CLIENT/进程链等兜底值) ───
+let server = null; // client 模式下的 MCP Server 实例
+function upgradeClientName() {
+  if (!server) return;
+  try {
+    const ci = server.getClientVersion();
+    if (ci?.name) CLIENT_INFO = `${ci.name}${ci.version ? '/' + ci.version : ''}`.slice(0, 80);
+    const fromMcp = normalizeClientName(ci?.title || ci?.name);
+    if (fromMcp) BRIDGE_CLIENT = fromMcp;
+  } catch {}
+}
+
+// ─── 版本自检(client 侧):把"只升了一半"变成调用时就能看见的一行告警 ───
+// skill 副本是 cp 出去的独立文件,最容易漏同步:改了 SKILL.md 忘跑 sync-skills-local.sh,
+// agent 读的就还是旧用法说明。故把各客户端 skills 目录里的副本版本也一并扫出来。
+const SKILL_DIRS = ['.claude/skills', '.agents/skills', '.codex/skills', '.gemini/skills', '.gemini/config/skills', '.joycode/skills'];
+function collectSkillVersions() {
+  const out = [];
+  for (const rel of SKILL_DIRS) {
+    const p = path.join(os.homedir(), rel, 'browser-link-tool', 'SKILL.md');
+    if (!fs.existsSync(p)) continue;
+    let version = null;
+    try { version = (fs.readFileSync(p, 'utf8').match(/<!--\s*blt-version:\s*([0-9]+\.[0-9]+\.[0-9]+)\s*-->/) || [])[1] || null; } catch {}
+    out.push({ path: p, version, state: version === VERSION ? 'ok' : (version ? 'version-mismatch' : 'unknown') });
+  }
+  return out;
+}
+
+// 汇总本次调用涉及的版本问题,返回一行告警(无问题返回 null)。
+// 刻意只警告不阻断:排查线上问题时被一个版本号拦死,比版本不一致本身更糟。
+function versionWarning(health) {
+  const bad = (health?.browsers || []).filter(b => b.versionState && b.versionState !== 'ok');
+  if (!bad.length) return null;
+  const items = bad.map(b => `${b.name}: ${b.versionDetail}`).join(' | ');
+  return `⚠️ 版本不一致(桥 v${VERSION}) — ${items}`;
+}
+
+// 把告警贴在工具返回的正文前面。只在有问题时插入,正常调用的输出一个字都不改。
+function withWarning(result, warn) {
+  if (!warn || !result?.content?.length) return result;
+  const first = result.content[0];
+  if (first?.type === 'text') first.text = `${warn}\n\n${first.text}`;
+  return result;
+}
+
+// ─── 连接与版本诊断(只读,不碰浏览器;扩展没连上时也能用) ───
+async function runConnectionInfo() {
+  const { state, health } = await fetchHealth();
+  // daemon 比自己旧时,它根本不认识版本字段:此时扩展的版本信息不可得,只能先换代再谈。
+  // 不做这层判断就会给每个扩展报一条 "xxx: undefined" 的废话。
+  const daemonTooOld = state === 'daemon' && health.version !== VERSION;
+  const info = {
+    bridge: state === 'daemon'
+      ? { version: health.version, build: health.build, pid: health.pid, wsPort: health.wsPort, httpPort: health.httpPort, daemonSince: health.daemonSince ? new Date(health.daemonSince).toISOString() : null }
+      : { state, note: state === 'none' ? 'daemon 未运行' : `端口 ${HTTP_PORT} 被非本工具服务占用` },
+    client: { version: VERSION, build: BUILD, sessionId: SESSION_ID, script: SCRIPT_PATH },
+    extensions: (health?.browsers || []).map(b => ({
+      name: b.name, id: b.id, brand: b.brand, focused: b.focused,
+      version: b.extVersion || null, versionName: b.extVersionName || null,
+      state: b.versionState || 'unknown',
+      detail: b.versionDetail || (daemonTooOld ? 'daemon 版本过旧,拿不到扩展版本(先让 daemon 换代)' : '扩展未上报版本,请重载扩展'),
+    })),
+    skills: collectSkillVersions(),
+  };
+  // 一句话结论:AI 和用户都只需看这行
+  const problems = [];
+  if (state !== 'daemon') problems.push('daemon 不可用');
+  if (daemonTooOld) problems.push(`daemon v${health.version} ≠ 本会话 client v${VERSION}:重启本 agent 的 MCP(或等它空闲自退)即可换代`);
+  if (state === 'daemon' && !info.extensions.length) problems.push('没有扩展连上来');
+  // daemon 太旧时扩展状态不可信,不逐条报,免得把"换代"这一个根因放大成一堆噪音
+  if (!daemonTooOld) for (const e of info.extensions) if (e.state !== 'ok') problems.push(`${e.name}: ${e.detail}`);
+  for (const s of info.skills) if (s.state !== 'ok') problems.push(`skill 副本 ${s.path} 版本 ${s.version || '未标注'} ≠ v${VERSION},请跑 sync-skills-local.sh`);
+  info.verdict = problems.length ? `有 ${problems.length} 处不一致` : `全部同代 ✔ v${VERSION}`;
+  info.problems = problems;
+  return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+}
+
+// ─── 通用工具调用(client 侧:每次调用一个临时 HTTP 请求转发给 daemon) ───
 async function callTool(request) {
   const toolName = request.params.name;
   const args = request.params.arguments || {};
+  upgradeClientName();
 
-  bumpIdleTimer(); // 每次工具调用视为一次交互，重置空闲计时
-
-  // 用 MCP 握手上报的 clientInfo.name 升级 client 名(比环境变量探测权威)。
-  // 此时 initialize 早已完成,getClientVersion() 可用。用户显式 BRIDGE_CLIENT 不被覆盖。
-  if (!CLIENT_FORCED) {
-    try {
-      const fromMcp = normalizeClientName(server.getClientVersion()?.name);
-      if (fromMcp) BRIDGE_CLIENT = fromMcp;
-    } catch {}
+  // 诊断工具排在所有校验之前:扩展没连上、版本对不上时它才最该用
+  if (toolName === 'mcp_browser_connection_info') {
+    try { return await runConnectionInfo(); }
+    catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true }; }
   }
 
-  // 代理模式先探活:校验对端确是本工具主实例，再看浏览器是否在线
-  if (isProxy) {
-    try {
-      const healthText = await proxyHttpRequest('/health', 'GET');
-      const health = JSON.parse(healthText);
-      if (health.service !== 'browser-link-tool' || health.status !== 'primary') {
-        return { content: [{ type: "text", text: `Error: Port ${HTTP_PORT} is occupied by a non-browser-link service; cannot forward.` }], isError: true };
-      }
-      if (!health.connected) {
-        return { content: [{ type: "text", text: "Error: Primary bridge reports no Chrome Extension connected." }], isError: true };
-      }
-    } catch (e) {
-      return { content: [{ type: "text", text: `Error: Cannot reach primary bridge on :${HTTP_PORT}. Is it still running?` }], isError: true };
-    }
+  // 调用前探活:daemon 不在(被杀/崩溃/空闲退出)就就地拉起;刚起的 daemon 等扩展重连一下
+  let { state, health } = await fetchHealth();
+  if (state === 'none') ({ state, health } = await ensureDaemon());
+  if (state === 'daemon' && !health.connected && Date.now() - (health.daemonSince || 0) < DAEMON_FRESH_MS) {
+    ({ state, health } = await waitExtensionConnected(EXT_RECONNECT_WAIT_MS));
   }
+  if (state === 'none') {
+    return { content: [{ type: "text", text: `Error: Bridge daemon on :${HTTP_PORT} is unreachable and could not be (re)started; see ${DAEMON_LOG}. Ask the user to check it (do NOT switch to another browser tool).` }], isError: true };
+  }
+  if (state === 'foreign') {
+    return { content: [{ type: "text", text: `Error: Port ${HTTP_PORT} is occupied by a non-browser-link service; cannot forward.` }], isError: true };
+  }
+  if (!health.connected) {
+    return { content: [{ type: "text", text: "Error: Bridge daemon reports no Chrome Extension connected. Ask the user to check the extension popup shows 'connected'." }], isError: true };
+  }
+
+  const warn = versionWarning(health);
 
   if (toolName === 'mcp_browser_scrolling_screenshot') {
     try {
-      return await runScrollingScreenshot(args);
+      return withWarning(await runScrollingScreenshot(args), warn);
     } catch (e) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
     }
@@ -846,113 +1212,197 @@ async function callTool(request) {
       const parsed = JSON.parse(responseText);
       if (parsed.error) {
         const extra = parsed.diag ? `\n${JSON.stringify(parsed.diag, null, 2)}` : '';
-        return { content: [{ type: "text", text: `Error: ${parsed.error}${extra}` }], isError: true };
+        return withWarning({ content: [{ type: "text", text: `Error: ${parsed.error}${extra}` }], isError: true }, warn);
       }
-      return { content: [{ type: "text", text: parsed.html || parsed.result || responseText }] };
+      return withWarning({ content: [{ type: "text", text: parsed.html || parsed.result || responseText }] }, warn);
     } catch {
-      return { content: [{ type: "text", text: responseText }] };
+      return withWarning({ content: [{ type: "text", text: responseText }] }, warn);
     }
   } catch (e) {
     return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
   }
 }
 
-// ─── 尝试晋升主实例:探活 → 原子绑定 → 失败即降级 PROXY ───
-async function tryStartPrimary() {
-  // 1. 探活优先
-  const probe = await probePrimaryHealth();
-  if (probe === 'primary') {
-    // 本工具主实例已就位，自觉转 PROXY，不争端口
-    console.error(`[bridge] Active primary instance detected on :${HTTP_PORT}, running in PROXY mode.`);
-    isProxy = true;
+// ─── daemon 绑定端口:探活 → 原子绑定 WS+HTTP → 失败返回 null(说明已有 daemon 在跑) ───
+async function bindDaemonPorts(onShutdown) {
+  const probe = (await fetchHealth(800)).state;
+  if (probe === 'daemon') {
+    console.error(`[bridge] Another bridge already serving :${HTTP_PORT}, this daemon exits.`);
     return null;
   }
   if (probe === 'foreign') {
-    // 端口被非本工具服务占用(或本工具正在启动、/health 尚未就绪)。
-    // 不 exit(避免误杀竞态中的正常场景)、也不抢端口,降级 PROXY;
-    // 运行期 callTool 的探活会对每次调用二次校验,对端不可用时返回明确错误。
-    console.error(`[bridge] Port ${HTTP_PORT} answered but not as browser-link primary; running in PROXY mode (will re-verify per call).`);
-    isProxy = true;
+    console.error(`[bridge] Port ${HTTP_PORT} answered but not as browser-link; this daemon exits.`);
     return null;
   }
 
-  // 2. 端口空闲(probe==='none') → 原子绑定 WS(48765) + HTTP(48766)
   const wssHttpServer = http.createServer();
   const httpServer = http.createServer();
   const rollback = (reason) => {
-    console.error(`[bridge] ${reason}, rolling back to PROXY mode.`);
+    console.error(`[bridge] ${reason}, daemon not started.`);
     try { wssHttpServer.close(); } catch {}
     try { httpServer.close(); } catch {}
-    isProxy = true;
     return null;
   };
+  // 探活扑空但端口已被占:典型竞态(另一 client 同时拉起的 daemon 抢先绑定),让它当家
+  if (!(await bindPortAtomic(wssHttpServer, WS_PORT))) return rollback(`WS port ${WS_PORT} occupied`);
+  console.error(`[bridge] DAEMON: WebSocket listening on 127.0.0.1:${WS_PORT}`);
+  // WS 已绑成功但 HTTP 冲突 → 必须先关掉 WS,否则占着端口空转
+  if (!(await bindPortAtomic(httpServer, HTTP_PORT))) return rollback(`HTTP port ${HTTP_PORT} occupied (WS already bound, releasing)`);
 
-  if (!(await bindPortAtomic(wssHttpServer, WS_PORT))) {
-    // 探活扑空但 WS 已被占:典型竞态(另一进程刚抢先绑定)，降级 PROXY 让它当主
-    return rollback(`WS port ${WS_PORT} occupied`);
+  return setupDaemon(wssHttpServer, httpServer, onShutdown);
+}
+
+// 轮询 /health 直到扩展连上或超时,返回最后一次 { state, health }
+async function waitExtensionConnected(ms) {
+  const deadline = Date.now() + ms;
+  let r = await fetchHealth();
+  while (!(r.state === 'daemon' && r.health.connected) && Date.now() < deadline) {
+    await sleep(500);
+    r = await fetchHealth();
   }
-  console.error(`[bridge] PRIMARY mode: WebSocket listening on 127.0.0.1:${WS_PORT}`);
+  return r;
+}
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
-  if (!(await bindPortAtomic(httpServer, HTTP_PORT))) {
-    // WS 已绑成功但 HTTP 冲突 → 必须先关掉 WS 再降级，否则占着端口空转
-    return rollback(`HTTP port ${HTTP_PORT} occupied (WS already bound, releasing)`);
+// ─── client:确保 daemon 在跑且不旧于自己 ───
+// (version, build) 二元组全序比较:只有严格更新的 client 才会让 daemon 退位,两版并存时不会互踢。
+function cmpVersion(a, b) {
+  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+  return 0;
+}
+function isOlderThanMe(h) {
+  const c = cmpVersion(h.version || '0.0.0', VERSION);
+  return c !== 0 ? c < 0 : (Number(h.build) || 0) < BUILD;
+}
+
+function spawnDaemon() {
+  fs.mkdirSync(BRIDGE_HOME, { recursive: true });
+  try { if (fs.statSync(DAEMON_LOG).size > 5 * 1024 * 1024) fs.truncateSync(DAEMON_LOG, 0); } catch {}
+  const fd = fs.openSync(DAEMON_LOG, 'a');
+  // detached:脱离 agent 的进程组,agent 会话退出/杀进程组时 daemon 不受牵连
+  const child = spawn(process.execPath, [SCRIPT_PATH, '--daemon'], {
+    detached: true, stdio: ['ignore', fd, fd], env: process.env, cwd: os.homedir(),
+  });
+  child.unref();
+  fs.closeSync(fd);
+  console.error(`[bridge] spawned daemon pid ${child.pid} (log: ${DAEMON_LOG})`);
+}
+
+async function waitHealth(pred, ms) {
+  const deadline = Date.now() + ms;
+  let r = await fetchHealth(500);
+  while (!pred(r) && Date.now() < deadline) {
+    await sleep(200);
+    r = await fetchHealth(500);
   }
-
-  return setupPrimaryInstance(wssHttpServer, httpServer);
+  return r;
 }
 
-// ─── 启动主流程 ───
-let primaryResources = await tryStartPrimary();
-// primaryResources 为 null 说明当前进程作为 PROXY 运行，请求透明转发至 127.0.0.1:48766。
-
-const server = new Server(
-  { name: "browser_link_tool", version: "1.5.0" },
-  { capabilities: { tools: {} } }
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFINITIONS }));
-server.setRequestHandler(CallToolRequestSchema, callTool);
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error(`[bridge] MCP server connected via stdio (mode: ${isProxy ? 'PROXY' : 'PRIMARY'})`);
-
-// ─── 空闲自退（仅代理实例）───
-// 主实例连着浏览器 WS，退出会断连，故不启用；代理实例是每会话拉起的转发进程，空闲即退避免堆积。
-let idleTimer = null;
-function bumpIdleTimer() {
-  if (!isProxy) return;
-  if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => {
-    console.error(`[bridge] PROXY idle for ${IDLE_TIMEOUT_MS / 60000}min, exiting.`);
-    cleanup();
-  }, IDLE_TIMEOUT_MS);
-  if (idleTimer.unref) idleTimer.unref(); // 计时器不阻止进程正常退出
-}
-bumpIdleTimer(); // 启动即开始计时；主实例中为 no-op
-
-// ─── PROXY 心跳:定时向 PRIMARY 上报"我还在线"(不计入调用次数)───
-// 让面板能显示"连着但空闲"的会话,而非只有正在调用的会话。主实例无需心跳(自刷)。
-let heartbeatTimer = null;
-if (isProxy) {
-  const beat = () => { proxyHttpRequest('/session_ping', 'GET').catch(() => {}); };
-  beat(); // 启动即上报一次
-  heartbeatTimer = setInterval(beat, HEARTBEAT_MS);
-  if (heartbeatTimer.unref) heartbeatTimer.unref();
-}
-
-async function cleanup() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  if (primaryResources) {
-    const { wss, wssHttpServer, httpServer, debounceTimer } = primaryResources;
-    if (wss) { wss.clients.forEach(c => c.close()); wss.close(); }
-    if (wssHttpServer) wssHttpServer.close();
-    if (httpServer) httpServer.close();
-    if (debounceTimer) clearTimeout(debounceTimer);
+let ensuring = null;
+function ensureDaemon() {
+  if (!ensuring) {
+    ensuring = (async () => {
+      let r = await fetchHealth();
+      if (r.state === 'daemon' && isOlderThanMe(r.health)) {
+        // daemon 比自己旧(升级了 bridge 但旧 daemon 还在跑)→ 请它退位,再拉起自己这版
+        const oldPid = r.health.pid;
+        console.error(`[bridge] daemon v${r.health.version || '?'} (pid ${oldPid || '?'}) older than v${VERSION}, asking it to shut down`);
+        const resp = await proxyHttpRequest('/shutdown', 'POST', null, 2000,
+          oldPid ? { 'x-bridge-target-pid': String(oldPid) } : {}).catch(() => '');
+        if (resp.includes('"ok"')) {
+          r = await waitHealth(x => x.state !== 'daemon' || x.health.pid !== oldPid, 3000);
+        } else {
+          r = await fetchHealth(); // 409=别的 client 已换代完成,端口上已是新 daemon;重新取一次,别拿旧快照往下走
+        }
+      }
+      if (r.state === 'none') {
+        spawnDaemon();
+        r = await waitHealth(x => x.state === 'daemon', 5000);
+      }
+      return r;
+    })().finally(() => { ensuring = null; });
   }
-  process.exit(0);
+  return ensuring;
 }
 
-process.stdin.on('close', cleanup);
-process.on('SIGINT', cleanup);
-process.on('SIGTERM', cleanup);
+// ─── daemon 主流程 ───
+async function runDaemon() {
+  process.title = 'browser-link-tool-daemon';
+  // 日志落文件,加时间戳便于排查
+  for (const k of ['log', 'error']) {
+    const orig = console[k].bind(console);
+    console[k] = (...a) => orig(new Date().toISOString(), ...a);
+  }
+  let res = null;
+  let exiting = false;
+  const shutdown = (reason) => {
+    if (exiting) return;
+    exiting = true;
+    console.error(`[bridge] daemon exiting: ${reason}`);
+    if (res) {
+      const { wss, wssHttpServer, httpServer, getDebounceTimer } = res;
+      try { wss.clients.forEach(c => c.close()); wss.close(); } catch {}
+      try { wssHttpServer.close(); } catch {}
+      try { httpServer.close(); } catch {}
+      clearTimeout(getDebounceTimer());
+    }
+    setTimeout(() => process.exit(0), 100);
+  };
+  res = await bindDaemonPorts(() => shutdown('shutdown requested'));
+  if (!res) process.exit(0);
+  console.error(`[bridge] daemon v${VERSION} build ${BUILD} pid ${process.pid} ready`);
+
+  // 空闲自退:所有 agent 会话都关了(无心跳)且无在途请求
+  setInterval(() => {
+    if (Date.now() - res.getLastClientSeenAt() > DAEMON_IDLE_MS && res.getPendingCount() === 0) {
+      shutdown(`no client for ${DAEMON_IDLE_MS / 60000}min`);
+    }
+  }, 60 * 1000);
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGHUP', () => {}); // 无控制终端,忽略
+}
+
+// ─── client 主流程(agent 以 stdio 拉起的那个进程) ───
+async function runClient() {
+  // 异常兜底:client 一退,Codex/JoyCode 不会重拉 → 该会话永久 Transport closed。故未捕获异常只记日志不退出;
+  // 唯一例外是 stdout 的 EPIPE(agent 已关管道,留着也没人收),此时正常退出。
+  const isPipeGone = (e) => e && (e.code === 'EPIPE' || e.code === 'ERR_STREAM_DESTROYED');
+  process.stdout.on('error', (e) => { if (isPipeGone(e)) process.exit(0); });
+  process.on('uncaughtException', (e) => {
+    if (isPipeGone(e)) process.exit(0);
+    console.error('[bridge] uncaughtException (kept alive):', e?.stack || e);
+  });
+  process.on('unhandledRejection', (e) => console.error('[bridge] unhandledRejection (kept alive):', e?.stack || e));
+
+  server = new Server(
+    { name: "browser_link_tool", version: VERSION },
+    { capabilities: { tools: {} } }
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFINITIONS }));
+  server.setRequestHandler(CallToolRequestSchema, callTool);
+  server.oninitialized = upgradeClientName;
+
+  // 先连 stdio 再管 daemon:握手不被 daemon 拉起耗时拖慢
+  await server.connect(new StdioServerTransport());
+  console.error(`[bridge] MCP client v${VERSION} connected via stdio (session ${SESSION_ID})`);
+
+  // 心跳:向 daemon 上报在线(面板展示 + 维持 daemon 不空闲退出);失败=daemon 不在 → 拉起
+  const beat = () => {
+    proxyHttpRequest('/session_ping', 'POST', null, 3000).catch(() => { ensureDaemon().catch(() => {}); });
+  };
+  ensureDaemon().catch(() => {}).finally(beat);
+  setInterval(beat, HEARTBEAT_MS).unref();
+
+  // client 不再空闲自退:Codex 等不会自动重拉 MCP,自退即 Transport closed。只随 agent 关闭 stdio 而退。
+  const exit = () => process.exit(0);
+  process.stdin.on('close', exit);
+  process.on('SIGINT', exit);
+  process.on('SIGTERM', exit);
+}
+
+if (IS_DAEMON) await runDaemon();
+else await runClient();
