@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Browser Link Tool - 一键安装脚本
-# 1) 安装 Node 依赖  2) 注册 MCP Server 到 Claude Code  3) 打印扩展加载指引
+# 1) 安装 Node 依赖  2) 注册 MCP Server 到 Claude Code / Codex / JoyCode  3) 换代运行中的 bridge  4) 打印下一步指引
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +43,10 @@ if [ -z "$NODE_BIN" ]; then
 fi
 NPM_BIN="$(dirname "$NODE_BIN")/npm"
 echo "==> 使用 Node: $NODE_BIN ($("$NODE_BIN" -v))"
+VERSION="$("$NODE_BIN" -p 'require(process.argv[1]).version' "$BRIDGE_DIR/package.json" 2>/dev/null || echo '?')"
+# 末尾「下一步」指引用:注册成功的 agent、会话是否要重开只有本脚本知道,由它统一给出,调用方(其它仓库的 init 脚本)原样转发
+REGISTERED=""
+add_registered() { REGISTERED="${REGISTERED:+$REGISTERED、}$1"; }
 
 # ── 1b. 版本一致性闸门 ─────────────────────────────────────
 # 三处版本(bridge/扩展/skill)必须同代才让装:否则装完也是"新桥配旧扩展",出问题还难查
@@ -64,17 +68,18 @@ echo "==> 安装依赖 (npm install @ mcp-bridge)…"
 if command -v claude >/dev/null 2>&1; then
   echo "==> 注册 MCP Server '$MCP_NAME' (scope=user)…"
   claude mcp remove "$MCP_NAME" -s user >/dev/null 2>&1 || true
-  claude mcp add "$MCP_NAME" -s user -- "$NODE_BIN" "$BRIDGE" \
-    && echo "   ✔ 已注册（command: $NODE_BIN $BRIDGE）" \
-    || {
-      echo "!! claude mcp add 失败，请手动在 MCP 配置中加入：" >&2
-      cat <<EOF >&2
+  if claude mcp add "$MCP_NAME" -s user -- "$NODE_BIN" "$BRIDGE"; then
+    echo "   ✔ 已注册（command: $NODE_BIN $BRIDGE）"
+    add_registered "Claude Code"
+  else
+    echo "!! claude mcp add 失败，请手动在 MCP 配置中加入：" >&2
+    cat <<EOF >&2
   "$MCP_NAME": {
     "command": "$NODE_BIN",
     "args": ["$BRIDGE"]
   }
 EOF
-    }
+  fi
 else
   echo "!! 未检测到 claude CLI。可改用 npx 方式（见 README 方式 A），或手动加 MCP 配置片段："
   cat <<EOF
@@ -91,6 +96,7 @@ if command -v codex >/dev/null 2>&1; then
   codex mcp remove "$MCP_NAME" >/dev/null 2>&1 || true
   if codex mcp add "$MCP_NAME" -- "$NODE_BIN" "$BRIDGE" >/dev/null 2>&1; then
     echo "   ✔ 已注册到 Codex（command: $NODE_BIN $BRIDGE）"
+    add_registered "Codex"
   else
     echo "!! codex mcp add 失败，可改用 npx 方式，或手动在 ~/.codex/config.toml 追加：" >&2
     cat <<EOF >&2
@@ -152,6 +158,7 @@ console.log(`   ✔ 已注册到 JoyCode（command: ${nodeBin} ${bridge}；原�
 JS
   then
     echo "   ⚠ JoyCode 运行中需重启（或新开会话）才加载新配置"
+    add_registered "JoyCode"
   else
     echo "!! 写入 JoyCode 配置失败，请手动在 $JOYCODE_CFG 追加：" >&2
     cat <<EOF >&2
@@ -175,6 +182,8 @@ fetch(`http://127.0.0.1:${process.argv[1]}/health`, { signal: AbortSignal.timeou
   .then(j => console.log(j.service !== "browser-link-tool" ? "foreign" : j.mode === "daemon" ? "daemon" : "legacy"))
   .catch(() => console.log("none"));
 ' "$HTTP_PORT" 2>/dev/null || echo none)"
+# 末尾指引 ③ 用的会话处置结论,随 bridge 状态定
+SESSION_HINT="新注册的 MCP 要新开 agent 会话（或 /mcp 重连）才加载"
 case "$BRIDGE_STATE" in
   daemon)
     echo "==> 重启常驻 daemon 以加载新版…"
@@ -182,6 +191,7 @@ case "$BRIDGE_STATE" in
 fetch(`http://127.0.0.1:${process.argv[1]}/shutdown`, { method: "POST", signal: AbortSignal.timeout(2000) }).catch(() => {});
 ' "$HTTP_PORT" 2>/dev/null || true
     echo "   ✔ 已重启 daemon（各 agent 会话下次调用自动换上新版，无需重开）"
+    SESSION_HINT="已开着的会话无需重开（daemon 已换新，下次调用自动生效）；新增的工具 / 参数要 /mcp 重连或新开会话后才出现"
     ;;
   legacy)
     echo "==> 检测到旧版 bridge（agent 拉起的主实例模型），结束全部旧进程以切换到常驻 daemon…"
@@ -194,12 +204,15 @@ fetch(`http://127.0.0.1:${process.argv[1]}/shutdown`, { method: "POST", signal: 
       fi
       echo "   ✔ 已结束旧版 bridge 进程 ${OLD_COUNT} 个"
       echo "   ⚠ 需重开会话：已开着的 agent 会话（Claude Code / Codex / JoyCode 等）请重开，或在会话里 /mcp 重连 browser-link-tool"
+      SESSION_HINT="已结束旧版 bridge 进程，正开着的 agent 会话必须重开（或 /mcp 重连），否则报「Transport closed」或「端口被其他服务占用」"
     else
       echo "!! 本机无 pkill，请先关闭所有 agent 会话（或在任务管理器结束 node 的 mcp-server-bridge 进程）后再开" >&2
+      SESSION_HINT="旧版 bridge 进程未能自动结束：先关闭所有 agent 会话再重开"
     fi
     ;;
   foreign)
     echo "!! 端口 $HTTP_PORT 被其他程序占用，browser-link-tool 无法启动；用 lsof -i :$HTTP_PORT 查看占用者" >&2
+    SESSION_HINT="端口 $HTTP_PORT 被其他程序占用，桥起不来：先用 lsof -i :$HTTP_PORT 查出占用者并结束"
     ;;
 esac
 
@@ -209,23 +222,30 @@ if [ -x "$SCRIPT_DIR/scripts/sync-skills-local.sh" ]; then
   "$SCRIPT_DIR/scripts/sync-skills-local.sh" || true
 fi
 
-# ── 5. 加载扩展指引 ───────────────────────────────────────
+# ── 5. 下一步指引 ─────────────────────────────────────────
+# 🚨「==> 安装完成」这一行是与调用方的唯一约定:其它仓库的 init 脚本从这行起原样转发给用户,改措辞会让它们取不到指引
 if [ -f "$EXTENSION_DIR/manifest.json" ]; then
-  EXT_HINT="     $EXTENSION_DIR"
+  EXT_HINT="       $EXTENSION_DIR"
 else
-  EXT_HINT="     !! 未在 $EXTENSION_DIR 找到 manifest.json，请确认从仓库获取了完整 extension/ 目录"
+  EXT_HINT="       !! 未在 $EXTENSION_DIR 找到 manifest.json，请确认从仓库获取了完整 extension/ 目录"
+fi
+if [ -n "$REGISTERED" ]; then
+  MCP_HINT="已注册到 ${REGISTERED}；其他 agent（Cursor / Gemini 等）按 $SCRIPT_DIR/README.md「方式 A」手动添加"
+else
+  MCP_HINT="!! 未自动注册到任何 agent（未检测到 claude / codex / JoyCode，或注册失败），按 $SCRIPT_DIR/README.md「方式 A」手动添加"
 fi
 cat <<EOF
 
-==> 安装完成 ✅
+==> 安装完成 ✅（browser-link-tool v$VERSION）
 
-下一步：在浏览器加载扩展（唯一必须人工的步骤）
-  1. 打开 chrome://extensions （或 edge://extensions）
-  2. 右上角开启「开发者模式」
-  3. 点击「加载已解压的扩展程序」，选择 extension/ 子目录（不是项目根目录）：
+下一步：
+  ① 浏览器扩展（唯一必须人工的步骤）
+     首次：chrome://extensions（或 edge://extensions）→ 开启「开发者模式」→「加载已解压的扩展程序」
+           → 选 extension/ 子目录（不是项目根目录）：
 $EXT_HINT
-  4. 打开任意网页，点击工具栏图标查看面板 —— 应显示「已连接」
-
-多会话隔离：在 MCP 工具调用中传 tabId（可用 mcp_browser_list_tabs 获取），
-不同 agent 会话即可各自锁定不同标签页，互不干扰。
+     已加载过：代码每次更新后都要在该页点 Browser Link Tool 的刷新按钮 ⟳（每个浏览器 / profile 各点一次）
+  ② MCP：$MCP_HINT
+  ③ agent 会话：$SESSION_HINT
+  ④ 自检：点扩展图标，面板显示「已连接」且「版本」行 扩展 v$VERSION ↔ 桥 v$VERSION 未标红；
+     或让 agent 调 mcp_browser_connection_info，看到三端同代即就绪
 EOF

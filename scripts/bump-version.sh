@@ -35,6 +35,7 @@ MODE="${1:-}"
 
 "$NODE_BIN" - "$PKG" "$MANIFEST" "$SKILL" "$MODE" <<'JS'
 const fs = require('fs');
+const path = require('path');
 const [pkgPath, manifestPath, skillPath, mode] = process.argv.slice(2);
 
 // skill 版本载体:HTML 注释,md 里不渲染、agent 读到也无害,且不动 frontmatter(避免客户端 schema 校验挑刺)
@@ -82,6 +83,16 @@ if (pkgNext === pkgRaw && readJson(pkgPath).version !== ver) {
   console.error('!! 未能在 package.json 中定位 version 字段'); process.exit(1);
 }
 fs.writeFileSync(pkgPath, pkgNext);
+
+// package-lock.json 根包版本必须同步:否则使用方 install.sh 里的 npm install 会改写它,
+// 把使用方的克隆弄脏 → 其 init 脚本「有未提交改动」从此跳过 fast-forward,再也拉不到新版
+const lockPath = path.join(path.dirname(pkgPath), 'package-lock.json');
+if (fs.existsSync(lockPath)) {
+  const lock = readJson(lockPath);
+  lock.version = ver;
+  if (lock.packages && lock.packages['']) lock.packages[''].version = ver;
+  fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n'); // 与 npm 写出格式一致,无 diff 噪音
+}
 
 // manifest.json:version 同步,并 upsert version_name = "x.y.z+build.<epoch>"
 let mfRaw = fs.readFileSync(manifestPath, 'utf8');
