@@ -170,9 +170,11 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 - **bridge 结构**：全机一个常驻 daemon(`mcp-server-bridge.mjs --daemon`,独占 48765/48766、与扩展保持长连接,日志 `~/.browser-link-tool/daemon.log`);每个 agent 会话拉起的只是轻量 client,每次工具调用是一次临时 HTTP 请求。daemon 不在/崩了,client 下次调用会**自动拉起**,别自己修。
 - **`unreachable and could not be (re)started`**：client 已就地尝试拉起 daemon 仍失败——读 `~/.browser-link-tool/daemon.log` 末尾找原因(多半端口被别的程序占用或 daemon 卡死)。daemon 卡死可 `pkill -f browser-link-tool-daemon` 后重试一次(**只杀 daemon 是安全的**:各会话的 client 不受影响,下次调用自动重拉);仍失败就停下告诉用户。
 - **🚨 桥不通时禁止改用其他浏览器工具**：不得切到 browser-use / Playwright / agent 内置浏览器等替代方案——它们不是用户眼前那个已登录的浏览器,登录态、tab、数据都对不上,查出来的结论不可信。修不通就停下告诉用户。
-- **`Transport closed` / MCP 连接断——自愈,别干等用户**：这是本会话的 client 进程没了(被杀/agent 侧断开)。按以下流程自起一条**专属** client 恢复，无需用户操作：
-  1. 启动独立进程：MCP 配置 args 是本地 `mcp-server-bridge.mjs` 路径就 `node <该路径>`;是 npx 安装(args 为 `-y browser-link-tool`)就 `npx -y browser-link-tool`。**别去工作区里找脚本**,它不在业务仓库里。
+- **`Transport closed` / MCP 连接断——先自救一次,别干等用户**：只说明本会话与 client 的连接断了(client 被杀或宿主断开都可能),**别直接断言"client 被杀"**。自救**最多一次**:
+  1. 启动**专属** client：MCP 配置 args 是本地 `mcp-server-bridge.mjs` 路径就 `node <该路径>`;是 npx 安装(args 为 `-y browser-link-tool`)就 `npx -y browser-link-tool`。**别去工作区里找脚本**,它不在业务仓库里。
   2. 走完 MCP 握手：`initialize` → `notifications/initialized` → `tools/list`。
-  3. 之后经这条 stdio 连接正常 `tools/call` 调 `mcp_browser_*`。
-  - 做不到(如 shell 无法维持交互式 stdio 进程)就直接请用户重启本 agent 的 MCP(Claude Code `/mcp` 重连;Codex/JoyCode 重开会话),不要转用其他浏览器工具。
-  - **🚨 红线**：**严禁 `pkill -f mcp-server-bridge` 这类无差别杀进程**——杀不到 daemon(进程名已改),反而连带杀掉其他 agent 会话的 client,Codex/JoyCode 不会自动重拉,直接 `Transport closed`。
+  3. 先调只读的 `mcp_browser_connection_info` 探活,通了再经这条 stdio 继续 `tools/call`。
+  - **断线前那次写操作(click/fill/navigate/set_* 等)结果未知,恢复后不自动重放**——先用 `snapshot`/`get_element` 等核对是否已生效,再决定要不要补做。
+  - 自救失败(握手不通、shell 无法维持交互式 stdio 进程等):`kill` 掉**本次自起的那个 pid**,然后请用户重连本 agent 的 MCP(Claude Code `/mcp`;Codex/JoyCode 无重连入口则新建会话),不要转用其他浏览器工具。
+  - **🚨 红线**：**严禁 `pkill -f mcp-server-bridge` 这类无差别杀进程**——杀不到 daemon(进程名已改),反而连带杀掉其他 agent 会话的 client,Codex/JoyCode 不会自动重拉,直接 `Transport closed`。用户要清理扩展面板「使用中的会话」里的某一行,只 `kill <该行 pid>`。
+  - client 在宿主关闭其 stdio 时会自动退出;会话关了 client 还在 = 宿主没断开 stdio(Codex/JoyCode 的 app-server 常见),属宿主行为,不是桥的 bug。
