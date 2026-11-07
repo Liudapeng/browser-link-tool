@@ -1,9 +1,9 @@
 ---
 name: browser-link-tool
-description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/真实键盘输入/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、让浏览器带登录态下载 URL 到磁盘并返回真实绝对路径、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。还可用于**前端开发自测闭环**：改完代码后在用户当前已打开的 localhost 标签页里触发交互、读控制台报错、抓接口请求、截图确认渲染，自测通过再交卷（登录态与弹窗层级完整保留，HMR 原地取证）。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc/逐字符输入」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「下载页面/接口数据到本地/把大数据落盘交脚本处理」「在指定标签页执行」「多个会话分别控制不同 tab」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或**在本地开发前端页面时要求「改完测一下交互/看看有没有报错/截图确认效果/自测后再交付」**，或提到 mcp_browser_* 工具时使用。
+description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-server-bridge）远程操控真实浏览器网页：列出可交互元素精简清单、DOM 结构树、元素取证(候选selector)、点选取证、探测页面框架/技术栈、读取页面 HTML、读元素状态/属性、点击/填充/下拉选择/真实键盘输入/悬停/滚动、导航、执行 JS、截图、等待元素、读写 localStorage/sessionStorage/Cookie、捕获 console 日志与 fetch/XHR 网络请求、让浏览器带登录态下载 URL 到磁盘并返回真实绝对路径、在 Arthas Web 控制台投递命令并采集执行结果，并支持多会话按 tabId 定向不同标签页互不干扰。还支持新开/关闭标签页、导航后退/前进/刷新并等加载完成、在 iframe 内操作、上传本地文件、拖拽（排序/滑块）、处理 alert/confirm/prompt 弹窗、整页/元素截图、一次调用批量执行多步，以及不经 MCP 的 `blt` 命令行直连。还可用于**前端开发自测闭环**：改完代码后在用户当前已打开的 localhost 标签页里触发交互、读控制台报错、抓接口请求、截图确认渲染，自测通过再交卷（登录态与弹窗层级完整保留，HMR 原地取证）。TRIGGER — 当用户要求「操作浏览器网页」「点击/填写/下拉选择页面某元素」「按回车/Tab/Esc/逐字符输入」「悬停展开菜单」「列出页面可点元素」「看页面 DOM 结构/骨架」「取证元素/拿某元素的 selector」「点选页面元素」「探测页面用什么框架/技术栈」「插件/油猴脚本开发解析网站」「截图当前页面」「读取页面 HTML/DOM」「等页面加载后再操作」「读写网页 Cookie/localStorage」「看页面报错/console 日志」「抓页面接口请求/响应」「下载页面/接口数据到本地/把大数据落盘交脚本处理」「在指定标签页执行」「多个会话分别控制不同 tab」「新开一个标签页/用完关掉」「后退/刷新页面」「iframe 里的输入框/按钮」「上传文件/附件」「拖拽排序/拖滑块」「页面弹了确认框/alert 卡住」「截整页长图/截某个元素」「批量执行一串操作」「在终端/脚本里直接操作浏览器(blt 命令)」「在 Arthas 控制台执行命令」「远程跑 arthas thread/watch/trace/jad」，或**在本地开发前端页面时要求「改完测一下交互/看看有没有报错/截图确认效果/自测后再交付」**，或提到 mcp_browser_* 工具时使用。
 ---
 
-<!-- blt-version: 1.6.0 -->
+<!-- blt-version: 1.7.0 -->
 
 # Browser Link Tool — 浏览器 MCP 操控
 
@@ -31,9 +31,15 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 | `mcp_browser_press_key` | `key`,`selector?` | 真实键盘输入(Enter/Tab/Esc/方向键/单字符),能录入字符与触发默认行为 |
 | `mcp_browser_hover` | `selector` | 悬停(仅触发 JS 监听,**不触发 CSS `:hover`**) |
 | `mcp_browser_scroll_to` | `selector` | 滚动元素到视口中央 |
-| `mcp_browser_navigate` | `url` | 跳转 |
+| `mcp_browser_navigate` | `url?`,`action?`(goto/back/forward/reload),`bypass_cache?`,`wait?`,`timeout?` | 跳转/后退/前进/刷新,默认等加载完成并回报耗时、最终 URL 与标题 |
+| `mcp_browser_new_tab` | `url?`,`active?`,`wait?`,`timeout?` | 新开 tab(默认后台)并把本会话绑定过去,回 `tabId` |
+| `mcp_browser_close_tab` | — | 关闭本会话用 `new_tab` 开的 tab,绑定自动回到开它之前的 tab;关别的 tab 须显式 `tabId`/`url_match` |
 | `mcp_browser_wait_for` | `selector`,`text?`,`visible?`,`timeout?` | 等待元素出现 |
-| `mcp_browser_scrolling_screenshot` | `output_path?` | 截当前可视区一屏 → PNG 路径 |
+| `mcp_browser_scrolling_screenshot` | `output_path?`,`full_page?`,`selector?`,`format?`,`quality?` | 截图 → 文件路径:缺省可视区;`full_page` 整页长图;`selector` 只截该元素。会先激活 tab |
+| `mcp_browser_drag` | `selector`,`target_selector`或`offset_x/offset_y`,`steps?`,`hold_ms?`,`mode?` | 拖拽:draggable 元素走 HTML5 DnD,其余走鼠标拖(前台 tab 用真实鼠标) |
+| `mcp_browser_upload_file` | `files`,`selector?` | 给 `<input type=file>` 设置本地文件(绝对路径),不弹系统选择框 |
+| `mcp_browser_dialog` | `mode?`,`prompt_text?` | 弹窗策略:`auto_accept`/`auto_dismiss`/`off`/`log`;`accept`/`dismiss` 应答当前弹窗(有限制,见下) |
+| `mcp_browser_batch` | `steps`,`stop_on_error?` | 一次调用顺序执行多步 `{tool,args}`,省往返;支持 `{tool:"sleep",args:{ms}}` |
 | `mcp_browser_get_console` | `clear?`,`max_items?` | 读 console 日志/报错(⚠️首调仅装钩子) |
 | `mcp_browser_get_network` | `clear?`,`with_body?`,`with_headers?`,`max_body?`,`max_items?` | 读 fetch/XHR 请求记录(⚠️首调仅装钩子;读取时可按需开启 body/headers) |
 | `mcp_browser_js_grep` | `pattern?`,`regex?`,`context?`,`max_hits?`,`sources?`,`download?`,`filename?` | 在页面已加载的 JS 源码里搜字符串/正则(定位参数生成逻辑),或将匹配 bundle 落盘返回磁盘路径 |
@@ -75,6 +81,43 @@ description: 通过浏览器 MCP 控制桥（Browser Link Tool 扩展 + mcp-serv
 - **`press_key` 走真实键盘输入（CDP）**：区别于合成事件，它能**真正录入字符**（逐字符按键可触发搜索联想/输入校验）并**触发浏览器默认行为**（`Tab` 真实移焦、`Enter` 提交）。传单个字符即输入该字符（如 `key:"a"`）；`selector` 缺省作用于当前焦点元素。与 DevTools(F12) 可共存。不可用时自动降级为合成事件，最坏表现与降级前一致。
 - **`hover` 不触发 CSS `:hover` 伪类** ⚠️：它只派发 `mouseover/mouseenter/mousemove`，能触发 **JS 监听**的菜单，但对纯 CSS 实现的菜单（`.menu:hover > .panel { display:block }`）**完全无效**。这是浏览器层面的限制，非工具缺陷——窗口无焦点时渲染引擎不更新 `:hover` 态，且该态会被真实鼠标物理位置覆盖、跨调用不保持，故无法用 CDP 绕过。
   - **纯 CSS 菜单的正确做法**：用 `evaluate` 直接读隐藏节点内容（`document.querySelector('.panel').innerHTML`），或临时改样式使其可见后再操作；也可 `outline({scope:"<面板选择器>"}) `+ `include_hidden:true` 拿隐藏项的 selector 直接 `click`。
+
+## 标签页 / iframe / 弹窗 / 拖拽 / 批量
+
+- **新开与回收**:要跑独立流程又不想动用户当前页时,`new_tab({url})`(默认后台打开、等加载完)→ 本会话自动绑到新 tab → 操作完 `close_tab()` 收尾,绑定回到原 tab。`close_tab` 不带参数只关**本会话 new_tab 开的** tab,不会误关用户页。
+- **导航**:`navigate({action:"back"|"forward"|"reload"})`;默认等到加载完成,`wait:false` 只发不等。
+- **iframe**:outline 会列出页面里的 iframe(`frame` 列)。DOM 类工具(outline/dom_tree/click/fill/select_option/get_element/evaluate/wait_for/scroll_to/hover/press_key/upload_file/drag/screenshot)都可带 `frame`——取 iframe 的 CSS selector、`name`/`id`、其**当前页面** URL 子串,或数字 frameId。跨域 iframe 支持读取、点击、填写等注入类操作,但**不支持** `upload_file` 与按元素截图(后者改为截 `<iframe>` 元素本身);跨域 iframe 用 selector 定位失败时改用 URL 子串。
+- **上传文件**:`upload_file({selector:"input[type=file]", files:["/abs/a.pdf"]})`,`files` 必须是本机绝对路径;隐藏的 file input 也能设。别去点「上传」按钮——那会弹系统文件框,工具管不到。
+- **🚨 弹窗(alert/confirm/prompt)——先设策略再触发**:原生弹窗会**阻塞整个页面**,弹出后再想应答多半来不及。正确做法:在点「删除/提交」这类可能弹确认框的按钮**之前**,先 `dialog({mode:"auto_accept"})`(或 `auto_dismiss`;prompt 用 `prompt_text` 指定输入值),再点按钮,事后 `dialog({mode:"log"})` 看弹过什么,**用完 `dialog({mode:"off"})` 关掉**。策略只在该 tab 停留在设置时的站点(origin)期间生效,跳到别的站点自动作废。
+  - `accept`/`dismiss` 只能应答「工具已接管页面后才弹出」的弹窗;若页面已被弹窗卡死(各工具超时),工具会报 `page is blocked`——**请用户手动关掉弹窗**,再设 auto_* 重做。
+  - auto_accept 等于替用户点了「确定」:删除/支付类确认框照样要先向用户确认意图。
+- **拖拽**:`drag({selector, target_selector})` 拖到目标元素,或 `offset_x/offset_y` 拖指定像素(滑块)。`mode` 缺省自动:draggable 元素走 HTML5 DnD;否则走鼠标拖——前台 tab 用真实鼠标,**后台 tab 只能合成事件**(需要真实鼠标的组件先 `activate_tab`)。
+- **批量**:多步确定的操作用 `batch` 一次跑完,省往返:
+  ```json
+  {"steps":[{"tool":"fill","args":{"selector":"#q","value":"abc"}},{"tool":"click","args":{"selector":"#go"}},{"tool":"sleep","args":{"ms":500}},{"tool":"get_element","args":{"selector":"#result","attr":"text"}}]}
+  ```
+  工具名可省 `mcp_browser_` 前缀;batch 顶层的 `tabId`/`url_match`、`browser`、`frame` 会下发给**未自带这些参数**的步骤(**不是**沿用上一步的参数——要在 iframe 里连做几步,把 `frame` 写在 batch 顶层或每一步里);默认遇错即停(`stop_on_error:false` 继续);最多 50 步,每步输出截断 4000 字符。需要看中间结果再决策的流程别塞进 batch。
+
+## CLI 直连(blt)
+
+不走 MCP、在 shell/脚本里直接调,与 MCP 共用同一 daemon 和扩展:
+
+```bash
+blt status                       # 三端版本/连接状态
+blt tabs                         # 列 tab
+blt open https://example.com     # new_tab 并绑定
+blt outline
+blt click '#submit'
+blt fill --selector '#q' --value hello
+blt eval 'document.title'
+blt shot --full-page /tmp/a.png
+echo '[{"tool":"click","args":{"selector":"#a"}}]' | blt batch -
+blt help click                   # 某工具的参数说明
+```
+
+- 未全局安装时用 `node <插件目录>/mcp-bridge/mcp-server-bridge.mjs <tool> ...`(或 `npx -y browser-link-tool <tool> ...`)。
+- 参数:`--k v` / `--k=v`(`--url-match` 等连字符写法自动映射),首个参数可按位置给(如 `navigate` 的 url、`click` 的 selector),也可整体传一个 JSON 对象。
+- tab 绑定按**当前目录**持久(同目录多次调用操作同一 tab);要隔离就设 `BLT_SESSION=<名字>`。出错写 stderr、退出码 1。
 
 ## 插件开发解析（dom_tree / inspect_element / pick_element / detect_env）
 
@@ -162,7 +205,7 @@ Arthas Console 是 xterm.js 终端(canvas 渲染、DOM 无文本、CSP 禁 eval)
 - **evaluate 无需写 `return`**：裸表达式（`document.title`）、多行以表达式结尾、顶层 `await`（`await fetch(u).then(r=>r.status)`）都能直接拿到值——内部自动判包裹。**唯一例外**：多语句且以表达式结尾又无 return（如 `let x=1; x+1`）会得 `undefined`，改写成 `let x=1; return x+1` 即可。返回值经 `String()` 序列化，复杂对象请自行 `JSON.stringify(...)`。
 - **拿到 `undefined` 不等于工具坏了**：`el.click()`/`el.dispatchEvent(...)`/赋值语句这类**本身就返回 undefined** 的代码，返回 undefined 是 JS 语义，与工具无关（换 `JSON.stringify` 包也没用）。要结果就在末尾追加取值表达式，如 `el.click(); document.querySelector('.modal') ? 'opened' : 'none'`；要看副作用（弹层是否出现等）用 `get_element`/`outline`/`scrolling_screenshot` 观测，别指望 click 的返回值。
 - **evaluate 读页面对象靠 MAIN world**：主路径走 debugger、降级路径走 executeScript，两者都注入页面 MAIN world，故 `window.Ext`/`VueRouter` 等页面全局变量都读得到。**开着 F12 也能用**——扩展的 `chrome.debugger` 与 DevTools 可共存（已实测 `evaluate`/`press_key` 在 F12 开启时均正常）；仅在 attach 真失败时才自动走降级路径（同样 MAIN，仍正常）。读到 `undefined` 先排查该全局变量是否本就不存在（而非「桥不通」）。
-- **截图**:`scrolling_screenshot` 截当前可视区一屏(不滚动拼接),返回 PNG 文件路径,随后可用 Read 查看。
+- **截图**:`scrolling_screenshot` 返回图片文件路径(默认 `/tmp/screenshot_<ts>.png`),随后可用 Read 查看。缺省截可视区;`full_page:true` 整页长图;`selector` 只截该元素(可配 `frame` 截 iframe 内元素,超出视口的高元素也完整)。长图建议 `format:"jpeg"` 控体积。截图会激活 tab(抢前台)。
 - **wait_for 超时**：默认 10s，慢页面显式加大 `timeout`。
 - **内部页不可操作**：`chrome://` / `edge://` / `about:` 无法 snapshot/注入。
 - **版本不一致告警(工具返回首行出现 `⚠️ 版本不一致`)**：桥与浏览器扩展不同代。**不阻断调用**,但此时的工具行为不可全信(新桥可能调到旧扩展没有的 action)。处置:让用户去 `chrome://extensions` 点 Browser Link Tool 的刷新按钮重载扩展;重载后告警自动消失。想看完整三端版本就调 `mcp_browser_connection_info`(只读,不碰页面),它直接给出 `verdict` 与 `problems` 清单。常见三种:扩展版本号与桥不符、扩展源码改了但没重载、skill 副本没跟着 `scripts/sync-skills-local.sh` 分发。

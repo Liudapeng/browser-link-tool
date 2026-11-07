@@ -9,7 +9,8 @@
 ## 能力
 
 - **前端开发自主调试闭环**:AI 改完代码后自己在你眼前的浏览器里测交互、读控制台报错、抓接口请求、截图确认渲染——**自测通过才交卷**,不再盲写。详见下文。
-- **通用网页操作**:读渲染后 HTML、CSS 选择器点击/填表/按键、导航、执行 JS、截图、等元素、读写 localStorage / Cookie。
+- **通用网页操作**:读渲染后 HTML、CSS 选择器点击/填表/按键/拖拽、导航(含后退/刷新)、新开/关闭标签页、iframe 内操作、上传文件、处理 alert/confirm/prompt、执行 JS、整页/元素截图、等元素、读写 localStorage / Cookie、批量多步一次执行。
+- **命令行直连**:`blt <tool> ...`(如 `blt tabs`、`blt click "#go"`、`blt shot --full-page`)不经 MCP 在终端/脚本里直接操作浏览器,`blt help` 查看用法。
 - **Arthas Web 控制台**:AI 生成命令 → 投递到网页终端执行 → 采集纯文本结果回传,免去人工在终端和对话间来回拷贝。全屏刷新命令(dashboard 等)自动取快照;高危命令(redefine/reset/…)会在页面弹确认框硬拦截。
 - **多浏览器**:Chrome / Edge / 多个 profile 可同时连上,`list_tabs` 汇总全部标签页,工具带 `browser` 参数定向。
 - **多会话隔离**:多个 AI 会话(Claude / Gemini / Codex …)可同时连一个浏览器。每个会话**自动绑定**它首次操作的标签页,之后不带 `tabId` 也只操作自己那个,互不串扰;需要时仍可显式传 `tabId` / `url_match` 切换目标(会更新绑定)。

@@ -200,7 +200,35 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 - 「跳到某页等首页加载完再截图」→ `navigate` → `wait_for` → `scrolling_screenshot`
 - 「读一下这个站点的 cookie / localStorage」→ `get_cookies` / `get_storage`
 
-典型交互范式:`list_tabs` 拿 tabId → `navigate` / `snapshot` 加载读取 → `wait_for` 等关键元素 → `click` / `fill` 交互 → `evaluate` / `snapshot` 验证。
+- 「开个新标签页跑完流程再关掉,别动我当前页」→ `new_tab` → … → `close_tab`
+- 「在 iframe 里的表单填值」→ `outline` 看 iframe 列表 → `fill` / `click` 带 `frame`
+- 「上传这个附件」→ `upload_file`(本机绝对路径)
+- 「点删除会弹确认框」→ 先 `dialog auto_accept` 再 `click`(原生弹窗弹出后会卡死页面,必须事先设策略)
+- 「拖拽排序 / 拖滑块」→ `drag`
+- 「截整页长图 / 只截这个卡片」→ `scrolling_screenshot` 带 `full_page` / `selector`
+
+典型交互范式:`list_tabs` 拿 tabId → `navigate` / `snapshot` 加载读取 → `wait_for` 等关键元素 → `click` / `fill` 交互 → `evaluate` / `snapshot` 验证。确定的多步操作可用 `batch` 一次跑完。
+
+### 命令行直连(blt)
+
+不经 MCP,在终端 / shell 脚本里直接调用,与 MCP 共用同一 daemon 和扩展(全局安装 `npm i -g browser-link-tool` 后有 `blt` 命令;否则 `node mcp-bridge/mcp-server-bridge.mjs <tool> ...` 或 `npx -y browser-link-tool <tool> ...`):
+
+```bash
+blt status                         # 连接与三端版本诊断
+blt tabs                           # 列标签页
+blt open https://example.com       # 新开 tab 并绑定
+blt fill "#q" "hello"              # 必填参数可按位置给
+blt click "#submit" --tabId 123
+blt eval "document.title"
+blt shot /tmp/a.png --full-page
+blt dialog auto_accept
+echo '[{"tool":"click","args":{"selector":"#a"}},{"tool":"sleep","args":{"ms":300}}]' | blt batch -
+blt help fill                      # 查看某工具参数
+```
+
+- 工具名可省 `mcp_browser_` 前缀,另有别名 `eval` / `shot` / `tabs` / `open` / `close` / `goto` / `upload` / `key` / `wait` 等;参数写 `--key value` 或 `--key=value`,也可整体传一个 JSON 对象。
+- tab 绑定按**当前目录**持久化(同目录多次调用操作同一 tab);需要隔离时设 `BLT_SESSION=<名字>`。`BLT_DEBUG=1` 打印内部日志。
+- 成功退出码 0;工具报错 / 参数错误写 stderr、退出码 1,便于脚本判断。
 
 ### 多标签页 / 多会话定向
 
@@ -270,8 +298,13 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 | `mcp_browser_press_key` | 真实键盘输入(CDP 优先,支持字符录入与 Tab/Enter/Esc 默认行为) |
 | `mcp_browser_hover` | 鼠标悬停(触发 JS 监听) |
 | `mcp_browser_scroll_to` | 将目标元素滚动到视口中央 |
-| `mcp_browser_navigate` | 跳转 URL |
-| `mcp_browser_scrolling_screenshot` | 截当前可视区一屏(PNG) |
+| `mcp_browser_navigate` | 跳转 / 后退 / 前进 / 刷新,默认等加载完成并回报最终 URL、标题、耗时 |
+| `mcp_browser_new_tab` / `close_tab` | 新开标签页并绑定到本会话 / 关闭本会话开的标签页(绑定回到原 tab) |
+| `mcp_browser_scrolling_screenshot` | 截图落盘:可视区 / 整页长图(`full_page`)/ 单个元素(`selector`),png 或 jpeg |
+| `mcp_browser_drag` | 拖拽到目标元素或按像素偏移(HTML5 DnD / 真实鼠标 / 合成鼠标自动选择) |
+| `mcp_browser_upload_file` | 给 `<input type=file>` 设置本地文件,不弹系统选择框 |
+| `mcp_browser_dialog` | alert / confirm / prompt 处理策略(自动确定 / 自动取消 / 记录)与应答 |
+| `mcp_browser_batch` | 一次调用顺序执行多步工具,省往返 |
 | `mcp_browser_list_tabs` | 列出所有标签页(拿 tabId) |
 | `mcp_browser_activate_tab` | 激活指定标签页 |
 | `mcp_browser_wait_for` | 等待元素出现(可选可见性 / 文本) |
@@ -284,7 +317,7 @@ wait_for / get_element → 检查红色校验文案是否如期出现
 | `mcp_browser_arthas_exec` | 在 Arthas Web 控制台投递命令并采集执行结果 |
 | `mcp_browser_connection_info` | 只读诊断:桥 / 扩展 / skill 三端版本与同代结论,不操作页面 |
 
-除 `list_tabs` 外,所有工具均支持可选 `tabId` / `url_match` 定向目标标签页;所有工具均支持可选 `browser` 定向浏览器(多浏览器同时连接时)。
+除 `list_tabs` 外,所有工具均支持可选 `tabId` / `url_match` 定向目标标签页;所有工具均支持可选 `browser` 定向浏览器(多浏览器同时连接时)。页面内容 / 元素类工具另支持可选 `frame`(iframe 的 CSS 选择器、URL 子串或 frameId),在 iframe 内操作,跨域 iframe 同样可用。
 
 ### 扩展面板
 

@@ -71,6 +71,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   const locked = await getLockedTabId();
   if (locked != null && locked === tabId) await clearLockedTab();
   await unbindClosedTab(tabId); // 该 tab 被任何会话绑定的,一并解绑
+  await mutateKey(AGENT_TABS_KEY, (m) => { if (!(tabId in m)) return false; delete m[tabId]; return true; });
+  await mutateKey(DIALOG_POLICY_KEY, (m) => { if (!(tabId in m)) return false; delete m[tabId]; return true; }, 'session');
 });
 
 // ─── 会话 ↔ tab 绑定:每个 agent 会话独立锁定自己操作的 tab(多会话互不干扰)───
@@ -84,17 +86,29 @@ async function getBindings() {
   } catch (e) { return {}; }
 }
 // 串行化所有 read-modify-write:storage 异步,多会话并发写会互相覆盖(后写者丢前写者),
-// 用一条 Promise 链把写操作排队,保证读-改-写原子。
+// 用一条 Promise 链把写操作排队,保证读-改-写原子。所有对象型 key 共用这一条链。
 let bindWriteChain = Promise.resolve();
-function mutateBindings(fn) {
+function mutateKey(key, fn, area = 'local') {
   bindWriteChain = bindWriteChain.then(async () => {
     try {
-      const b = await getBindings();
-      if (fn(b)) await chrome.storage.local.set({ [SESSION_BIND_KEY]: b });
+      const store = chrome.storage[area];
+      const o = await store.get(key);
+      const m = (o && o[key]) || {};
+      if (fn(m)) await store.set({ [key]: m });
     } catch (e) {}
   });
   return bindWriteChain;
 }
+function mutateBindings(fn) { return mutateKey(SESSION_BIND_KEY, fn); }
+async function readKey(key, area = 'local') {
+  try { const o = await chrome.storage[area].get(key); return (o && o[key]) || {}; } catch (e) { return {}; }
+}
+
+// agent 经 new_tab 开出的 tab:{ tabId: { sid, prev } }。close_tab 不带显式目标时只关这类 tab(防误关用户页面),
+// 关完把会话绑定还原到开 tab 前的那个(prev)
+const AGENT_TABS_KEY = 'agentTabs';
+// 弹窗自动应答策略:{ tabId: { mode, promptText } },存 storage.session(SW 重启保留、浏览器重启清空)
+const DIALOG_POLICY_KEY = 'dialogPolicy';
 async function setBinding(sessionId, tabId) {
   if (!sessionId) return;
   await mutateBindings((b) => { b[sessionId] = tabId; return true; });
@@ -169,6 +183,206 @@ async function resolveTabInner(msg) {
 function isInternalPage(url) {
   return url && (url.startsWith('chrome://') || url.startsWith('edge://') || url.startsWith('about:'));
 }
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// CDP 命令在页面被 alert 等阻塞时可能永不返回,统一加超时,别让整个 action 卡到 daemon 超时
+function withTimeout(p, ms, label) {
+  let t;
+  return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${label || 'operation'} timed out after ${ms}ms`)), ms); })])
+    .finally(() => clearTimeout(t));
+}
+
+// ─── iframe 定向:msg.frame = iframe 元素的 CSS 选择器(顶层文档内) / frame URL 子串 / 数字 frameId ───
+// 不用 webNavigation 权限:allFrames 注入一次即可拿到每个 frame 的 frameId 与 href。
+// 选择器路径对同源 iframe 打一次性标记精确命中;跨域 iframe 读不到 contentDocument,退按 src 匹配。
+async function listFrames(tabId, token) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: (tk) => {
+      const de = document.documentElement;
+      const marked = !!(tk && de && de.getAttribute('data-blt-frame') === tk);
+      if (marked) de.removeAttribute('data-blt-frame');
+      return { href: location.href, name: window.name || '', marked };
+    },
+    args: [token || null]
+  });
+  return (res || []).filter(r => r && r.result).map(r => ({ frameId: r.frameId, ...r.result }));
+}
+async function resolveFrameId(tabId, frame) {
+  if (frame == null || String(frame).trim() === '') return 0;
+  const f = String(frame).trim();
+  if (/^\d+$/.test(f)) return Number(f);
+  const token = Math.random().toString(36).slice(2);
+  let probe = null;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [0] },
+      func: (sel, tk) => {
+        let el;
+        try { el = document.querySelector(sel); } catch (_) { return null; } // 不是合法选择器 → 当 URL 子串
+        if (!el || !/^(IFRAME|FRAME)$/.test(el.tagName)) return null;
+        try { el.contentDocument.documentElement.setAttribute('data-blt-frame', tk); return { marked: true, src: el.src }; }
+        catch (_) { return { marked: false, src: el.src || '' }; }
+      },
+      args: [f, token]
+    });
+    probe = r && r.result;
+  } catch (_) {}
+  const frames = await listFrames(tabId, probe && probe.marked ? token : null);
+  const brief = (list) => list.slice(0, 10).map(x => `${x.frameId}:${x.href.slice(0, 120)}`).join(' | ');
+  let hits;
+  if (probe) {
+    if (probe.marked) hits = frames.filter(x => x.marked);
+    else {
+      // 跨域 iframe:按 src 全等匹配;iframe 内跳转/重定向过则 src≠href,退一步按同 origin 且唯一匹配
+      hits = frames.filter(x => x.frameId !== 0 && probe.src && x.href === probe.src);
+      if (!hits.length && probe.src) {
+        let o = '';
+        try { o = new URL(probe.src).origin; } catch (_) {}
+        const same = o ? frames.filter(x => x.frameId !== 0 && x.href.startsWith(o + '/')) : [];
+        if (same.length === 1) hits = same;
+      }
+    }
+    if (!hits.length) throw new Error(`iframe "${f}" found but its frame could not be matched (not loaded / sandboxed / navigated away from its src) — pass a URL substring of the frame's current page or a numeric frameId instead; frames: ${brief(frames)}`);
+  } else {
+    hits = frames.filter(x => x.frameId !== 0 && (x.href.includes(f) || (x.name && x.name === f)));
+    if (!hits.length) throw new Error(`No frame matching "${f}" (tried as iframe selector, URL substring, name); frames: ${brief(frames)}`);
+  }
+  if (hits.length > 1) throw new Error(`frame "${f}" is ambiguous, pass numeric frameId instead: ${brief(hits)}`);
+  return hits[0].frameId;
+}
+// executeScript 的 target:带 frame 时只注入该 frame
+async function frameTarget(tab, msg) {
+  const fid = await resolveFrameId(tab.id, msg && msg.frame);
+  return fid ? { tabId: tab.id, frameIds: [fid] } : { tabId: tab.id };
+}
+
+// ─── 等页面加载完:先挂监听再触发导航,见到 loading→complete 才算完 ───
+// SPA/hash 跳转不进 loading:1.5s 内没进 loading 且 tab 已 complete 视为完成。超时不报错,如实回报状态。
+function waitTabLoad(tabId, timeoutMs) {
+  const t0 = Date.now();
+  let cancel = () => {};
+  const p = new Promise((resolve) => {
+    let sawLoading = false;
+    let done = false;
+    const finish = (state) => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpd);
+      resolve({ state, ms: Date.now() - t0 });
+    };
+    cancel = () => finish('cancelled');
+    const onUpd = (id, info) => {
+      if (id !== tabId) return;
+      if (info.status === 'loading') sawLoading = true;
+      if (info.status === 'complete' && sawLoading) finish('complete');
+    };
+    chrome.tabs.onUpdated.addListener(onUpd);
+    const poll = setInterval(async () => {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t.status === 'loading') sawLoading = true;
+        else if (t.status === 'complete' && (sawLoading || Date.now() - t0 > 1500)) finish('complete');
+      } catch (e) { finish('closed'); }
+    }, 250);
+    const timer = setTimeout(() => finish('timeout'), timeoutMs || 30000);
+  });
+  p.cancel = () => cancel(); // 触发导航失败时调用方必须 cancel,否则监听器与轮询要挂满整个超时
+  return p;
+}
+
+// ─── 元素在顶层视口中的坐标(CDP 鼠标/截图按顶层视口坐标投递) ───
+// 注入到元素所在 frame 执行:滚入视口 → 取 rect → 沿 frameElement 链累加各级 iframe 偏移。
+// 跨域 iframe 拿不到 frameElement → 报 crossorigin,调用方降级或报错。
+// 同时做中心点命中测试:被弹层/遮罩盖住时 CDP 按坐标投递会打到上层元素,必须拦下(见 ENGINEERING_GUIDE)。
+async function elementTopRect(target, selector, scroll = true) {
+  const [r] = await chrome.scripting.executeScript({
+    target,
+    func: (sel, doScroll) => {
+      let el;
+      try { el = document.querySelector(sel); } catch (e) { return { error: 'invalid selector: ' + e.message }; }
+      if (!el) return { error: `Element ${sel} not found` };
+      if (doScroll) { try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (_) {} }
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const hit = document.elementFromPoint(cx, cy);
+      const occluded = !(hit && (hit === el || el.contains(hit)));
+      let x = r.left;
+      let y = r.top;
+      let w = window;
+      try {
+        while (w !== w.top) {
+          const fe = w.frameElement;
+          if (!fe) return { error: 'crossorigin' };
+          const fr = fe.getBoundingClientRect();
+          const cs = w.parent.getComputedStyle(fe);
+          x += fr.left + fe.clientLeft + parseFloat(cs.paddingLeft || 0);
+          y += fr.top + fe.clientTop + parseFloat(cs.paddingTop || 0);
+          w = w.parent;
+        }
+      } catch (_) { return { error: 'crossorigin' }; }
+      return {
+        x, y, w: r.width, h: r.height,
+        scrollX: w.scrollX, scrollY: w.scrollY, vw: w.innerWidth, vh: w.innerHeight,
+        occluded, hitDesc: hit ? (hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + (typeof hit.className === 'string' && hit.className ? '.' + hit.className.trim().split(/\s+/).slice(0, 2).join('.') : '')) : null,
+        draggable: !!(el.closest && el.closest('[draggable="true"]')),
+        // 后台 tab / 最小化窗口:CDP Input.dispatchMouseEvent 等渲染进程 ack 会一直挂住,调用方据此直接走合成事件
+        hidden: document.visibilityState !== 'visible',
+      };
+    },
+    args: [selector, scroll]
+  });
+  return r ? r.result : { error: 'injection failed' };
+}
+
+// ─── 弹窗自动应答:MAIN world 覆盖 alert/confirm/prompt(各 frame 各一份),记录到 window.__blt_dialog__ ───
+// 页面刷新即失效,故策略存 storage.session、每次 tab 加载完重新注入;加载期间就弹的对话框兜不住(只能 dialog accept/dismiss)
+async function applyDialogPolicy(tabId, mode, promptText) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    world: 'MAIN',
+    func: (mode, promptText) => {
+      const w = window;
+      const st = w.__blt_dialog__ || (w.__blt_dialog__ = { log: [], mode: 'off', orig: { alert: w.alert, confirm: w.confirm, prompt: w.prompt } });
+      if (mode === 'log') return { mode: st.mode, log: st.log.slice() };
+      if (mode === 'off') {
+        w.alert = st.orig.alert;
+        w.confirm = st.orig.confirm;
+        w.prompt = st.orig.prompt;
+        st.mode = 'off';
+        return { mode: 'off', log: [] };
+      }
+      st.mode = mode;
+      st.promptText = promptText;
+      const rec = (type, message, result) => {
+        st.log.push({ type, message: String(message == null ? '' : message).slice(0, 500), result, url: location.href.slice(0, 200), t: Date.now() });
+        if (st.log.length > 50) st.log.shift();
+      };
+      const acc = () => st.mode === 'auto_accept';
+      w.alert = function (m) { rec('alert', m, null); };
+      w.confirm = function (m) { const r = acc(); rec('confirm', m, r); return r; };
+      w.prompt = function (m, def) { const r = acc() ? (st.promptText != null ? st.promptText : (def != null ? String(def) : '')) : null; rec('prompt', m, r); return r; };
+      return { mode, log: [] };
+    },
+    args: [mode, promptText]
+  });
+  return (res || []).map(r => r && r.result).filter(Boolean);
+}
+// 策略只对设置时的 origin 生效:tab 跳到别的站点即作废——否则用户后来在同 tab 别的站点手动点「删除」,确认框会被静默放行
+function originOf(url) { try { return new URL(url).origin; } catch (_) { return ''; } }
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (info.status !== 'complete') return;
+  const pol = (await readKey(DIALOG_POLICY_KEY, 'session'))[tabId];
+  if (!pol) return;
+  if (pol.origin && originOf(tab && tab.url) !== pol.origin) {
+    await mutateKey(DIALOG_POLICY_KEY, (m) => { if (!(tabId in m)) return false; delete m[tabId]; return true; }, 'session');
+    return;
+  }
+  try { await applyDialogPolicy(tabId, pol.mode, pol.promptText); } catch (e) {}
+});
 
 // evaluate 结果为 undefined 时回传的提示串——undefined 常因代码以 el.click()/赋值/void 等
 // 「无返回值语句」结尾（JS 语义，非工具故障）。加提示引导 Agent，而非静默返回裸 'undefined' 被误判为工具坏。
@@ -295,13 +509,13 @@ function cdpKeyDescriptor(key) {
 
 // CDP 按键：产生真实字符输入 + 触发浏览器默认行为（Tab 移焦、Enter 提交等）。
 // selector 为空时作用于当前焦点元素（与原实现语义一致）。
-async function pressKeyViaCDP(tabId, selector, key) {
+async function pressKeyViaCDP(tabId, selector, key, injTarget) {
   const desc = cdpKeyDescriptor(key);
   if (!desc) return { ok: false, reason: 'unsupported_key' };
-  // 指定了 selector：先聚焦目标（CDP 按键作用于焦点元素，不接受 selector）
+  // 指定了 selector：先聚焦目标（CDP 按键作用于焦点元素，不接受 selector）;iframe 内元素聚焦后按键自然落到该 frame
   if (selector) {
     const focused = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: injTarget || { tabId },
       func: (sel) => {
         const el = document.querySelector(sel);
         if (!el) return 'notfound';
@@ -315,6 +529,13 @@ async function pressKeyViaCDP(tabId, selector, key) {
     // notfocusable（如 div 无 tabindex）仍继续：事件会落到 document/body，与原实现行为接近
   }
   if (!(await cdpAcquire(tabId))) return { ok: false, reason: 'attach_failed' };
+  // 后台 tab / 窗口无焦点时页面不持有键盘焦点,dispatchKeyEvent 照样返回成功但按键被丢弃(实测静默失效)。
+  // 焦点模拟让页面视为已聚焦,按完关掉,不影响前台 tab 的正常焦点
+  let focusEmu = false;
+  try {
+    await withTimeout(cdpSend(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true }), 2000, 'setFocusEmulationEnabled');
+    focusEmu = true;
+  } catch (_) {}
   try {
     const common = {
       key: desc.key,
@@ -331,6 +552,7 @@ async function pressKeyViaCDP(tabId, selector, key) {
   } catch (e) {
     return { ok: false, reason: 'cdp_error: ' + (e && e.message) };
   } finally {
+    if (focusEmu) { try { await withTimeout(cdpSend(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false }), 2000, 'setFocusEmulationEnabled'); } catch (_) {} }
     cdpRelease(tabId);
   }
 }
@@ -509,13 +731,13 @@ function connect() {
 
         case 'list_tabs': {
           const tabs = await chrome.tabs.query({});
+          // 不回 favIconUrl:不少站点是内联 data: 图标(单个数 KB base64),几十个 tab 就把 agent 上下文撑爆,而 agent 用不上它
           const list = tabs.map(t => ({
             tabId: t.id,
             title: t.title,
             url: t.url,
             active: t.active,
-            windowId: t.windowId,
-            favIconUrl: t.favIconUrl
+            windowId: t.windowId
           }));
           send(msg.id, { result: JSON.stringify(list) });
           return;
@@ -544,7 +766,7 @@ function connect() {
             return send(msg.id, { error: 'Cannot snapshot internal browser pages' });
           }
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: () => document.documentElement.outerHTML
           });
           if (results && results[0]) send(msg.id, { html: results[0].result });
@@ -557,6 +779,8 @@ function connect() {
           // 优先走 chrome.debugger（DevTools 协议 Runtime.evaluate）：在页面上下文执行动态字符串，
           // 但不受页面 CSP 的 script-src 约束，可正常跑严格 CSP（禁 eval）站点的代码。
           try {
+            // 指定 frame 时直接走注入路径:Runtime.evaluate 只打顶层 frame 的默认上下文
+            if (msg.frame != null && String(msg.frame).trim() !== '') throw new Error('frame-targeted');
             const result = await evaluateViaDebugger(tab.id, msg.code);
             const s = String(result);
             if (s.startsWith('Error: ')) send(msg.id, { error: s.slice(7) });
@@ -566,7 +790,7 @@ function connect() {
             // debugger 不可用（如已被 DevTools 占用、权限被拒）时，降级到扩展注入器 new Function。
             // 该路径受页面 CSP 约束，仅适用于未禁 eval 的普通页面。
             const results = await chrome.scripting.executeScript({
-              target: { tabId: tab.id },
+              target: await frameTarget(tab, msg),
               world: 'MAIN', // 必须注入 MAIN world：页面的 Ext/框架/自定义全局变量都挂在 MAIN 的 window 上，ISOLATED world 是隔离副本读不到，会返回 undefined。
               func: async (codeStr, wrap, undefHint) => {
                 // wrap=true（含顶层 return）：async 函数包裹，与 debugger 路径一致。
@@ -593,7 +817,7 @@ function connect() {
         case 'click': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (selector) => {
               try {
                 const el = document.querySelector(selector);
@@ -627,7 +851,7 @@ function connect() {
         case 'fill': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (sel, val) => {
               try {
                 const el = document.querySelector(sel);
@@ -659,8 +883,74 @@ function connect() {
 
         case 'navigate': {
           const tab = await resolveTab(msg);
-          await chrome.tabs.update(tab.id, { url: msg.url });
-          send(msg.id, { result: `Navigated to ${msg.url}` });
+          const act = msg.nav_action || (msg.url ? 'goto' : 'reload');
+          const wantWait = msg.wait !== false;
+          const timeoutMs = Number(msg.timeout) || 30000;
+          if (!['goto', 'back', 'forward', 'reload'].includes(act)) throw new Error(`Unknown navigate action "${act}" (goto|back|forward|reload)`);
+          if (act === 'goto' && !msg.url) throw new Error('url is required for action "goto"');
+          // 先挂监听再触发导航,否则快页面的 loading→complete 可能在挂监听前就走完
+          const w = wantWait ? waitTabLoad(tab.id, timeoutMs) : null;
+          try {
+            if (act === 'goto') await chrome.tabs.update(tab.id, { url: msg.url });
+            else if (act === 'back') await chrome.tabs.goBack(tab.id);
+            else if (act === 'forward') await chrome.tabs.goForward(tab.id);
+            else await chrome.tabs.reload(tab.id, { bypassCache: !!msg.bypass_cache });
+          } catch (e) {
+            if (w) w.cancel();
+            throw e;
+          }
+          const head = act === 'goto' ? `Navigated to ${msg.url}` : `Done: ${act}`;
+          if (!w) { send(msg.id, { result: head + ' (not waiting for load)' }); return; }
+          const st = await w;
+          let info = '';
+          try { const t = await chrome.tabs.get(tab.id); info = ` | url: ${t.url} | title: ${t.title || ''}`; } catch (e) {}
+          send(msg.id, { result: `${head}\nload: ${st.state} (${st.ms}ms)${info}` + (st.state === 'timeout' ? '\n(page still loading — content may be partial; use wait_for on a key element)' : '') });
+          return;
+        }
+
+        case 'new_tab': {
+          // 在本会话当前绑定 tab 所在窗口开新 tab 并改绑过去;记下原绑定,close_tab 时还原
+          const sid = msg.__session;
+          let prev = await getBinding(sid);
+          let windowId;
+          if (prev != null) { try { windowId = (await chrome.tabs.get(prev)).windowId; } catch (e) { prev = null; } }
+          if (windowId == null) { const a = await getActiveTab(); if (a) windowId = a.windowId; }
+          const opts = { active: !!msg.active, url: msg.url || 'about:blank' };
+          if (windowId != null) opts.windowId = windowId;
+          const created = await chrome.tabs.create(opts);
+          await setBinding(sid, created.id);
+          await mutateKey(AGENT_TABS_KEY, (m) => { m[created.id] = { sid: sid || null, prev }; return true; });
+          let st = null;
+          if (msg.url && msg.wait !== false) st = await waitTabLoad(created.id, Number(msg.timeout) || 30000);
+          let t = created;
+          try { t = await chrome.tabs.get(created.id); } catch (e) {}
+          resolvedTabByMsgId.set(msg.id, { tabId: t.id, title: t.title || '' });
+          send(msg.id, { result: JSON.stringify({ tabId: t.id, windowId: t.windowId, url: t.url || t.pendingUrl, title: t.title, active: t.active, load: st ? st.state : 'not-waited', note: 'session now bound to this tab' }) });
+          return;
+        }
+
+        case 'close_tab': {
+          const sid = msg.__session;
+          const agentTabs = await readKey(AGENT_TABS_KEY);
+          const before = await getBinding(sid);
+          let tab;
+          if (msg.tabId != null || msg.url_match != null) {
+            tab = await resolveTab(msg); // 显式目标:用户/agent 明确点名,直接关
+          } else {
+            if (before == null) throw new Error('No tab bound to this session; pass tabId or url_match to close a specific tab');
+            if (!agentTabs[before]) throw new Error(`Bound tab ${before} was not opened via new_tab; refusing to close a user tab implicitly — pass tabId/url_match explicitly if you really mean it`);
+            tab = await chrome.tabs.get(before);
+          }
+          const rec = agentTabs[tab.id];
+          await chrome.tabs.remove(tab.id);
+          await unbindClosedTab(tab.id);
+          // 绑定还原:关的是 agent 开的 tab → 回到开它之前的 tab;否则回到调用前的绑定(显式关别的 tab 不该丢掉自己的绑定)
+          let restored = null;
+          for (const cand of [rec && rec.sid === (sid || null) ? rec.prev : null, before]) {
+            if (cand == null || cand === tab.id) continue;
+            try { await chrome.tabs.get(cand); await setBinding(sid, cand); restored = cand; break; } catch (e) {}
+          }
+          send(msg.id, { result: `Closed tab ${tab.id} (${tab.title || tab.url || ''})` + (restored != null ? `; session re-bound to tab ${restored}` : '; session has no bound tab now (next call falls back to the active tab)') });
           return;
         }
 
@@ -669,7 +959,7 @@ function connect() {
           const timeout = msg.timeout || 10000;
           const interval = msg.interval || 300;
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: async (selector, text, wantVisible, timeoutMs, intervalMs) => {
               const deadline = Date.now() + timeoutMs;
               const isVisible = (el) => {
@@ -699,7 +989,7 @@ function connect() {
         case 'outline': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (opts) => {
               const { includeHidden, maxItems, scope } = opts;
               const root = scope ? document.querySelector(scope) : document;
@@ -794,9 +1084,16 @@ function connect() {
                 return '[' + o.i + '] ' + o.kind + t + flags + ' @' + o.selector;
               });
               const header = out.length + ' interactive element(s)' + (truncated ? ' (truncated at ' + maxItems + ')' : '');
-              return header + (lines.length ? '\n' + lines.join('\n') : '');
+              // iframe 里的元素不在本清单内:列出页面 iframe,提示 agent 带 frame 参数进去操作
+              let tail = '';
+              if (opts.listFrames) {
+                const ifr = Array.from(document.querySelectorAll('iframe, frame')).filter(f => { const r = f.getBoundingClientRect(); return r.width > 1 && r.height > 1; });
+                if (ifr.length) tail = '\n-- ' + ifr.length + ' iframe(s); elements inside are NOT listed above — pass frame=<selector below | src substring> to outline/click/fill inside:\n'
+                  + ifr.slice(0, 20).map(f => '  @' + selectorFor(f) + ' src=' + String(f.getAttribute('src') || f.src || '(none)').slice(0, 120)).join('\n');
+              }
+              return header + (lines.length ? '\n' + lines.join('\n') : '') + tail;
             },
-            args: [{ includeHidden: msg.include_hidden === true, maxItems: msg.max_items || 200, scope: msg.scope || null }]
+            args: [{ includeHidden: msg.include_hidden === true, maxItems: msg.max_items || 200, scope: msg.scope || null, listFrames: msg.frame == null || String(msg.frame).trim() === '' }]
           });
           sendResult(msg.id, results[0].result);
           return;
@@ -805,7 +1102,7 @@ function connect() {
         case 'get_element': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (selector, attr) => {
               try {
                 const el = document.querySelector(selector);
@@ -838,7 +1135,7 @@ function connect() {
         case 'select_option': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (selector, value, byLabel) => {
               try {
                 const el = document.querySelector(selector);
@@ -866,13 +1163,14 @@ function connect() {
           const tab = await resolveTab(msg);
           // 优先 CDP 真实按键：产生真实字符（'a'→录入 "a"）、触发浏览器默认行为（Tab 真实移焦）。
           // 合成 KeyboardEvent 两者都做不到，只能让页面的 keydown 监听器收到事件。
-          const viaCdp = await pressKeyViaCDP(tab.id, msg.selector || null, msg.key);
+          const tgt = await frameTarget(tab, msg); // 只解析一次:带 frame 时每次解析都要注入两轮脚本
+          const viaCdp = await pressKeyViaCDP(tab.id, msg.selector || null, msg.key, tgt);
           if (viaCdp.ok) { send(msg.id, { result: 'success' }); return; }
           // 元素找不到是确定性错误，不必降级重试
           if (viaCdp.reason === 'notfound') { sendResult(msg.id, `Error: Element ${msg.selector} not found`); return; }
           // 其余原因（DevTools 占用 / 未支持键名 / CDP 报错）→ 降级到合成事件，保证不比改造前差
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: tgt,
             func: (selector, key) => {
               try {
                 const el = selector ? document.querySelector(selector) : document.activeElement;
@@ -906,7 +1204,7 @@ function connect() {
           const tab = await resolveTab(msg);
           // 保持合成事件实现（不走 CDP，原因见上文 hover 不走 CDP 的实测结论）。
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (selector) => {
               try {
                 const el = document.querySelector(selector);
@@ -929,7 +1227,7 @@ function connect() {
         case 'scroll_to': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (selector) => {
               try {
                 const el = document.querySelector(selector);
@@ -947,7 +1245,7 @@ function connect() {
         case 'inspect_element': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (selector, px, py) => {
               try {
                 const el = selector ? document.querySelector(selector)
@@ -1063,7 +1361,7 @@ function connect() {
         case 'dom_tree': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (opts) => {
               try {
                 const { scope, maxDepth, maxNodes, includeText } = opts;
@@ -1119,7 +1417,7 @@ function connect() {
         case 'detect_env': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             world: 'MAIN', // 框架挂在页面 window 上，必须 MAIN world 才探得到
             func: () => {
               try {
@@ -1182,7 +1480,7 @@ function connect() {
           // 首次调用装 hook 返回 installed:true，之后读缓存并按当次调用的 withBody/withHeaders/maxBody 动态裁剪返回。
           // 必须注入 MAIN world：页面的 fetch/XHR 都在 MAIN，ISOLATED world 的 window 是另一个对象、劫持不到。
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             world: 'MAIN',
             func: (clear, max, withBody, withHeaders, maxBody) => {
               const KEY = '__blt_net_buf__';
@@ -1501,7 +1799,7 @@ function connect() {
           // 之后每次调用读出缓存。SW 休眠也不丢日志（数据存在页面里）。clear=true 读完清空。
           // 必须注入 MAIN world：页面的 console/onerror 都在 MAIN，ISOLATED world 劫持不到页面日志。
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             world: 'MAIN',
             func: (clear, max) => {
               const KEY = '__blt_console_buf__';
@@ -1542,7 +1840,7 @@ function connect() {
         case 'get_storage': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (type, key) => {
               try {
                 const store = type === 'session' ? sessionStorage : localStorage;
@@ -1564,7 +1862,7 @@ function connect() {
         case 'set_storage': {
           const tab = await resolveTab(msg);
           const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: await frameTarget(tab, msg),
             func: (type, key, value) => {
               try {
                 const store = type === 'session' ? sessionStorage : localStorage;
@@ -1867,15 +2165,342 @@ function connect() {
         }
 
         case 'scrolling_screenshot': {
-          // 截取目标 tab 当前可视区一屏：
-          // captureVisibleTab 只能截取窗口当前处于激活态(active)的标签页；若目标 tab 在后台，先激活再截，防止截串页。
-          const activeTab = await resolveTab(msg);
-          if (!activeTab.active) {
-            await chrome.tabs.update(activeTab.id, { active: true });
-            await new Promise(r => setTimeout(r, 80));
+          // 默认截当前可视区一屏;full_page 截整页、selector 截单个元素(两者走 CDP Page.captureScreenshot)。
+          // captureVisibleTab 只能截窗口当前激活的 tab;CDP 截图虽不要求激活,但后台 tab 可能未合成画面,统一先激活。
+          const tab = await resolveTab(msg);
+          if (!tab.active) {
+            await chrome.tabs.update(tab.id, { active: true });
+            await sleep(150);
           }
-          const dataUrl = await chrome.tabs.captureVisibleTab(activeTab.windowId, { format: 'png' });
-          send(msg.id, { result: JSON.stringify({ dataUrl }) });
+          const format = msg.format === 'jpeg' ? 'jpeg' : 'png';
+          const quality = format === 'jpeg' ? Math.min(100, Math.max(1, Number(msg.quality) || 80)) : undefined;
+          const sel = msg.selector || null;
+          const wantFull = !!msg.full_page && !sel;
+          let dataUrl = null;
+          let note = '';
+          if (wantFull || sel) {
+            let er = null;
+            let selTgt = null;
+            if (sel) {
+              selTgt = await frameTarget(tab, msg);
+              er = await elementTopRect(selTgt, sel, true);
+              if (er.error) throw new Error(er.error === 'crossorigin' ? 'element is inside a cross-origin iframe — screenshot the <iframe> element itself (selector of the iframe, no frame param)' : er.error);
+              if (er.w < 1 || er.h < 1) throw new Error(`element ${sel} has zero size (hidden?)`);
+              await sleep(80); // 等 scrollIntoView 后的重绘
+            }
+            if (await cdpAcquire(tab.id)) {
+              let overridden = false;
+              try {
+                const lm = await withTimeout(cdpSend(tab.id, 'Page.getLayoutMetrics'), 5000, 'getLayoutMetrics');
+                const css = lm.cssLayoutViewport || lm.layoutViewport;
+                const dpr = (lm.layoutViewport && css && css.clientWidth) ? (lm.layoutViewport.clientWidth / css.clientWidth) || 1 : 1;
+                const MAX_DEVICE_PX = 16384; // Chromium 单张位图边长上限,超了会截出空白/失败
+                const maxCss = Math.floor(MAX_DEVICE_PX / dpr);
+                const cs = lm.cssContentSize || lm.contentSize;
+                const params = { format, fromSurface: true };
+                if (quality) params.quality = quality;
+                let beyond;
+                if (wantFull) {
+                  const h = Math.min(Math.ceil(cs.height), maxCss);
+                  if (cs.height > maxCss) note = `page is ${Math.ceil(cs.height)}px tall, truncated to first ${h}px`;
+                  params.clip = { x: 0, y: 0, width: Math.min(Math.ceil(css.clientWidth), maxCss), height: h, scale: 1 };
+                  beyond = h > css.clientHeight;
+                } else {
+                  // clip 用文档坐标(视口坐标 + 顶层滚动偏移)
+                  const h = Math.min(er.h, maxCss);
+                  params.clip = { x: Math.max(0, er.x + er.scrollX), y: Math.max(0, er.y + er.scrollY), width: er.w, height: h, scale: 1 };
+                  beyond = er.h > er.vh || er.w > er.vw;
+                  if (er.occluded) note = `element center is covered by ${er.hitDesc || 'another element'} — the image shows what is on top`;
+                }
+                if (beyond) {
+                  // 超出视口:有头浏览器里单靠 captureBeyondViewport 会把视口那一屏平铺重复(实测),
+                  // 必须临时把视口撑到所需高度让页面真正渲染出来,截完立即还原
+                  const needH = Math.min(maxCss, Math.ceil(Math.max(css.clientHeight, params.clip.y + params.clip.height)));
+                  await withTimeout(cdpSend(tab.id, 'Emulation.setDeviceMetricsOverride', { width: Math.ceil(css.clientWidth), height: needH, deviceScaleFactor: 0, mobile: false }), 5000, 'setDeviceMetricsOverride');
+                  overridden = true;
+                  await sleep(300);
+                  // 撑大视口会让 100vh/min-height:100vh 类布局重排,override 前量的 clip 可能已错位——按重排后的布局重新取
+                  if (sel) {
+                    const er2 = await elementTopRect(selTgt, sel, false).catch(() => null);
+                    if (er2 && !er2.error && er2.w >= 1 && er2.h >= 1) {
+                      const y2 = Math.max(0, er2.y + er2.scrollY);
+                      params.clip = { x: Math.max(0, er2.x + er2.scrollX), y: y2, width: er2.w, height: Math.max(1, Math.min(er2.h, needH - y2)), scale: 1 };
+                    }
+                  } else {
+                    const lm2 = await withTimeout(cdpSend(tab.id, 'Page.getLayoutMetrics'), 5000, 'getLayoutMetrics').catch(() => null);
+                    const cs2 = lm2 && (lm2.cssContentSize || lm2.contentSize);
+                    if (cs2 && Math.abs(cs2.height - cs.height) > 2) {
+                      params.clip.height = Math.min(Math.ceil(cs2.height), needH);
+                      note = (note ? note + '; ' : '') + 'page height depends on viewport height (100vh layout) — full-page image may look stretched compared with normal browsing';
+                    }
+                  }
+                }
+                const shot = await withTimeout(cdpSend(tab.id, 'Page.captureScreenshot', params), 20000, 'captureScreenshot');
+                dataUrl = `data:image/${format};base64,${shot.data}`;
+              } catch (e) {
+                note = `CDP screenshot failed (${e.message}); fell back to visible viewport`;
+              } finally {
+                if (overridden) { try { await withTimeout(cdpSend(tab.id, 'Emulation.clearDeviceMetricsOverride'), 5000, 'clearDeviceMetricsOverride'); } catch (_) {} }
+                cdpRelease(tab.id);
+              }
+            } else {
+              note = 'debugger attach failed; fell back to visible viewport (full_page/selector need CDP)';
+            }
+          }
+          if (!dataUrl) {
+            const t = await chrome.tabs.get(tab.id);
+            dataUrl = await withTimeout(chrome.tabs.captureVisibleTab(t.windowId, quality ? { format, quality } : { format }), 20000, 'captureVisibleTab');
+          }
+          send(msg.id, { result: JSON.stringify({ dataUrl, format, note: note || undefined }) });
+          return;
+        }
+
+        case 'drag': {
+          const tab = await resolveTab(msg);
+          if (!msg.selector) throw new Error('selector is required');
+          const hasOffset = msg.offset_x != null || msg.offset_y != null;
+          if (!msg.target_selector && !hasOffset) throw new Error('pass target_selector, or offset_x/offset_y');
+          const tgt = await frameTarget(tab, msg);
+          const steps = Math.max(1, Math.min(100, Number(msg.steps) || 10));
+          const holdMs = Math.max(0, Math.min(5000, Number(msg.hold_ms) || 0));
+          const src = await elementTopRect(tgt, msg.selector, true);
+          if (src.error && src.error !== 'crossorigin') throw new Error(src.error);
+          let mode = msg.mode || 'auto';
+          if (mode === 'auto') mode = src.draggable ? 'html5' : 'mouse';
+          let via = null;
+          let warn = '';
+          // mouse 模式优先 CDP 真实鼠标(isTrusted、能驱动 pointer capture 类拖拽库);起点被遮挡/跨域 iframe/attach 失败 → 合成事件
+          if (mode === 'mouse' && !src.error && !src.occluded) {
+            const sx = src.x + src.w / 2;
+            const sy = src.y + src.h / 2;
+            let ex;
+            let ey;
+            if (msg.target_selector) {
+              const dst = await elementTopRect(tgt, msg.target_selector, false);
+              if (dst.error) throw new Error('target: ' + dst.error);
+              ex = dst.x + dst.w / 2;
+              ey = dst.y + dst.h / 2;
+              if (ex < 0 || ey < 0 || ex > dst.vw || ey > dst.vh) warn = ' (warning: drop point is outside the viewport; scroll/zoom so both ends are visible if the drop did not land)';
+            } else {
+              ex = sx + (Number(msg.offset_x) || 0);
+              ey = sy + (Number(msg.offset_y) || 0);
+            }
+            if (src.hidden) {
+              warn += ' (tab is in background, used synthetic events; activate_tab first if the page needs trusted mouse input)';
+            } else if (await cdpAcquire(tab.id)) {
+              let pressed = false;
+              try {
+                // 首个事件短超时探路:没 ack 说明渲染进程不收输入,此时还没按下鼠标,降级合成事件不会重复拖拽
+                const mouse = (type, x, y, extra, ms = 5000) => withTimeout(cdpSend(tab.id, 'Input.dispatchMouseEvent', { type, x, y, button: 'left', ...extra }), ms, 'dispatchMouseEvent');
+                await mouse('mouseMoved', sx, sy, { buttons: 0, button: 'none' }, 1500);
+                pressed = true;
+                await mouse('mousePressed', sx, sy, { buttons: 1, clickCount: 1 });
+                await sleep(50);
+                for (let i = 1; i <= steps; i++) {
+                  await mouse('mouseMoved', sx + (ex - sx) * i / steps, sy + (ey - sy) * i / steps, { buttons: 1 });
+                  await sleep(16);
+                }
+                if (holdMs) await sleep(holdMs);
+                await mouse('mouseReleased', ex, ey, { buttons: 0, clickCount: 1 });
+                via = 'cdp-mouse';
+              } catch (e) {
+                // 已按下后才失败:拖拽可能已部分生效,再用合成事件重拖会叠加位移——松开鼠标后如实报错,不重试
+                if (pressed) {
+                  try { await withTimeout(cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: ex, y: ey, button: 'left', buttons: 0, clickCount: 1 }), 1500, 'release'); } catch (_) {}
+                  throw new Error(`CDP drag failed midway (${e.message}); the element may have partially moved — check with get_element/screenshot before retrying`);
+                }
+                warn += ` (CDP failed: ${e.message}; retried with synthetic events)`;
+              } finally {
+                cdpRelease(tab.id);
+              }
+            }
+          } else if (mode === 'mouse' && src.occluded) {
+            warn = ` (start point covered by ${src.hitDesc}; used synthetic events dispatched to the element)`;
+          }
+          if (!via) {
+            const [r] = await chrome.scripting.executeScript({
+              target: tgt,
+              func: async (srcSel, dstSel, offX, offY, nSteps, html5, hold) => {
+                const s = document.querySelector(srcSel);
+                if (!s) return { error: `Element ${srcSel} not found` };
+                const sr = s.getBoundingClientRect();
+                const sx = sr.left + sr.width / 2;
+                const sy = sr.top + sr.height / 2;
+                let d = null;
+                let ex;
+                let ey;
+                if (dstSel) {
+                  d = document.querySelector(dstSel);
+                  if (!d) return { error: `Target ${dstSel} not found` };
+                  const dr = d.getBoundingClientRect();
+                  ex = dr.left + dr.width / 2;
+                  ey = dr.top + dr.height / 2;
+                } else {
+                  ex = sx + (offX || 0);
+                  ey = sy + (offY || 0);
+                }
+                const wait = (ms) => new Promise(res => setTimeout(res, ms));
+                const at = (x, y) => document.elementFromPoint(x, y) || d || document.body;
+                const opt = (x, y, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, ...extra });
+                if (html5) {
+                  const dt = new DataTransfer();
+                  s.dispatchEvent(new DragEvent('dragstart', opt(sx, sy, { dataTransfer: dt })));
+                  let over = null;
+                  for (let i = 1; i <= nSteps; i++) {
+                    const x = sx + (ex - sx) * i / nSteps;
+                    const y = sy + (ey - sy) * i / nSteps;
+                    const el = (i === nSteps && d) ? d : at(x, y);
+                    if (el !== over) {
+                      if (over) over.dispatchEvent(new DragEvent('dragleave', opt(x, y, { dataTransfer: dt })));
+                      el.dispatchEvent(new DragEvent('dragenter', opt(x, y, { dataTransfer: dt })));
+                      over = el;
+                    }
+                    el.dispatchEvent(new DragEvent('dragover', opt(x, y, { dataTransfer: dt })));
+                    s.dispatchEvent(new DragEvent('drag', opt(x, y, { dataTransfer: dt })));
+                    await wait(16);
+                  }
+                  if (hold) await wait(hold);
+                  const dropEl = d || at(ex, ey);
+                  dropEl.dispatchEvent(new DragEvent('drop', opt(ex, ey, { dataTransfer: dt })));
+                  s.dispatchEvent(new DragEvent('dragend', opt(ex, ey, { dataTransfer: dt })));
+                  return { ok: true, via: 'synthetic-html5' };
+                }
+                const P = (el, type, x, y, buttons) => { try { el.dispatchEvent(new PointerEvent(type, opt(x, y, { pointerId: 1, isPrimary: true, pointerType: 'mouse', button: 0, buttons }))); } catch (_) {} };
+                const M = (el, type, x, y, buttons) => el.dispatchEvent(new MouseEvent(type, opt(x, y, { button: 0, buttons })));
+                P(s, 'pointerdown', sx, sy, 1);
+                M(s, 'mousedown', sx, sy, 1);
+                for (let i = 1; i <= nSteps; i++) {
+                  const x = sx + (ex - sx) * i / nSteps;
+                  const y = sy + (ey - sy) * i / nSteps;
+                  const el = at(x, y);
+                  P(el, 'pointermove', x, y, 1);
+                  M(el, 'mousemove', x, y, 1);
+                  if (el !== document) { P(document, 'pointermove', x, y, 1); M(document, 'mousemove', x, y, 1); }
+                  await wait(16);
+                }
+                if (hold) await wait(hold);
+                const up = d || at(ex, ey);
+                P(up, 'pointerup', ex, ey, 0);
+                M(up, 'mouseup', ex, ey, 0);
+                M(document, 'mouseup', ex, ey, 0);
+                return { ok: true, via: 'synthetic-mouse' };
+              },
+              args: [msg.selector, msg.target_selector || null, Number(msg.offset_x) || 0, Number(msg.offset_y) || 0, steps, mode === 'html5', holdMs]
+            });
+            const res = r && r.result;
+            if (!res || res.error) throw new Error((res && res.error) || 'drag injection failed');
+            via = res.via;
+          }
+          send(msg.id, { result: `Dragged ${msg.selector} → ${msg.target_selector || `offset(${msg.offset_x || 0},${msg.offset_y || 0})`} via ${via}${warn}. Verify the outcome with get_element/outline/screenshot.` });
+          return;
+        }
+
+        case 'upload_file': {
+          // 网页 JS 无权给 <input type=file> 塞本地文件,只能走 CDP DOM.setFileInputFiles(浏览器读磁盘,真实触发 input/change)
+          const tab = await resolveTab(msg);
+          const files = Array.isArray(msg.files) ? msg.files.filter(Boolean) : [];
+          if (!files.length) throw new Error('files must be a non-empty array of absolute paths');
+          const tgt = await frameTarget(tab, msg);
+          const token = Math.random().toString(36).slice(2);
+          const [m] = await chrome.scripting.executeScript({
+            target: tgt,
+            func: (sel, tk, n) => {
+              let el;
+              try { el = document.querySelector(sel); } catch (e) { return { error: 'invalid selector: ' + e.message }; }
+              if (!el) return { error: `Element ${sel} not found` };
+              if (!(el.tagName === 'INPUT' && el.type === 'file')) {
+                const inner = el.querySelector('input[type=file]');
+                if (!inner) return { error: `${sel} is not <input type=file> and contains none — the visible upload button usually wraps/labels a hidden file input; outline with include_hidden=true to find it` };
+                el = inner;
+              }
+              if (el.disabled) return { error: 'file input is disabled' };
+              if (n > 1 && !el.multiple) return { error: `input accepts a single file but ${n} were given` };
+              el.setAttribute('data-blt-upload', tk);
+              return { ok: true, accept: el.accept || '', multiple: el.multiple };
+            },
+            args: [msg.selector || 'input[type=file]', token, files.length]
+          });
+          const mr = m && m.result;
+          if (!mr || mr.error) throw new Error((mr && mr.error) || 'injection failed');
+          const cleanup = async () => {
+            const [rb] = await chrome.scripting.executeScript({
+              target: tgt,
+              func: (tk) => {
+                const el = document.querySelector(`[data-blt-upload="${tk}"]`);
+                if (!el) return null;
+                el.removeAttribute('data-blt-upload');
+                return Array.from(el.files || []).map(f => `${f.name} (${f.size}B${f.type ? ', ' + f.type : ''})`);
+              },
+              args: [token]
+            }).catch(() => [null]);
+            return rb && rb.result;
+          };
+          if (!(await cdpAcquire(tab.id))) { await cleanup(); throw new Error('debugger attach failed — upload needs CDP (another debugger client may hold this tab)'); }
+          try {
+            await withTimeout(cdpSend(tab.id, 'DOM.getDocument', { depth: -1, pierce: true }), 10000, 'DOM.getDocument');
+            const s = await withTimeout(cdpSend(tab.id, 'DOM.performSearch', { query: `[data-blt-upload="${token}"]`, includeUserAgentShadowDOM: true }), 10000, 'DOM.performSearch');
+            if (!s.resultCount) throw new Error('marked file input not visible to CDP (cross-origin iframe is unsupported for upload)');
+            const { nodeIds } = await cdpSend(tab.id, 'DOM.getSearchResults', { searchId: s.searchId, fromIndex: 0, toIndex: s.resultCount });
+            try { await cdpSend(tab.id, 'DOM.discardSearchResults', { searchId: s.searchId }); } catch (e) {}
+            await withTimeout(cdpSend(tab.id, 'DOM.setFileInputFiles', { files, nodeId: nodeIds[0] }), 15000, 'DOM.setFileInputFiles');
+          } catch (e) {
+            await cleanup();
+            throw e;
+          } finally {
+            cdpRelease(tab.id);
+          }
+          const got = await cleanup();
+          send(msg.id, { result: `Uploaded ${files.length} file(s) to file input${mr.accept ? ` (accept=${mr.accept})` : ''}: ${got ? got.join('; ') : '(could not read back)'}. input/change events fired; the page may still need a submit/upload click.` });
+          return;
+        }
+
+        case 'dialog': {
+          const tab = await resolveTab(msg);
+          const mode = msg.mode || 'accept';
+          if (mode === 'accept' || mode === 'dismiss') {
+            // 应答当前已弹出的 alert/confirm/prompt。弹窗期间页面 JS 被阻塞,executeScript 会挂住,只有 CDP 能应答——
+            // 但 Chrome 只把「Page 域启用期间弹出」的弹窗交给 CDP:先弹出、后 attach 的弹窗 handleJavaScriptDialog 一律报 No dialog is showing
+            // (实测;此时 Page.enable 本身也会因渲染进程被阻塞而挂住)。故这里能救的有限,真正可靠的是事先设 auto_*。
+            if (!(await cdpAcquire(tab.id))) throw new Error('debugger attach failed — cannot answer the dialog');
+            let seen = null;
+            const onEv = (source, method, params) => { if (source.tabId === tab.id && method === 'Page.javascriptDialogOpening') seen = params; };
+            chrome.debugger.onEvent.addListener(onEv);
+            let noDialog = false;
+            try {
+              try { await withTimeout(cdpSend(tab.id, 'Page.enable'), 1500, 'Page.enable'); } catch (e) {}
+              await sleep(50);
+              const p = { accept: mode === 'accept' };
+              if (msg.prompt_text != null) p.promptText = String(msg.prompt_text);
+              await withTimeout(cdpSend(tab.id, 'Page.handleJavaScriptDialog', p), 5000, 'handleJavaScriptDialog');
+            } catch (e) {
+              if (!/No dialog is showing/i.test(e.message)) throw e;
+              noDialog = true;
+            } finally {
+              chrome.debugger.onEvent.removeListener(onEv);
+              cdpRelease(tab.id);
+            }
+            if (noDialog) {
+              // 区分「确实没弹窗」与「有个 CDP 接管不了的原生弹窗卡着页面」:探针脚本挂住即页面被阻塞
+              const blocked = await withTimeout(chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => 1 }), 1500, 'probe').then(() => false, () => true);
+              throw new Error(blocked
+                ? 'The page is blocked (most likely by a native JS dialog that opened before this tool attached — Chrome does not let it be answered remotely afterwards). Ask the user to close the dialog in the browser, then set mode=auto_accept/auto_dismiss BEFORE repeating the action that triggers it.'
+                : 'No JS dialog is showing on this tab (page is responsive).');
+            }
+            send(msg.id, { result: `Dialog ${mode === 'accept' ? 'accepted' : 'dismissed'}` + (seen ? `: [${seen.type}] "${String(seen.message || '').slice(0, 300)}"` : '') });
+            return;
+          }
+          if (!['auto_accept', 'auto_dismiss', 'off', 'log'].includes(mode)) throw new Error(`Unknown dialog mode "${mode}" (accept|dismiss|auto_accept|auto_dismiss|off|log)`);
+          if (mode !== 'log') {
+            await mutateKey(DIALOG_POLICY_KEY, (mm) => {
+              if (mode === 'off') { if (!(tab.id in mm)) return false; delete mm[tab.id]; return true; }
+              mm[tab.id] = { mode, promptText: msg.prompt_text != null ? String(msg.prompt_text) : null, origin: originOf(tab.url) };
+              return true;
+            }, 'session');
+          }
+          const res = await applyDialogPolicy(tab.id, mode, msg.prompt_text != null ? String(msg.prompt_text) : null);
+          const log = res.flatMap(x => x.log || []).sort((a, b) => a.t - b.t);
+          const head = mode === 'log' ? `Dialog log (${log.length})` : `Dialog policy "${mode}" applied to ${res.length} frame(s)` + (mode === 'off' ? '' : ` — re-applied after each page load while the tab stays on ${originOf(tab.url) || 'this site'}, dropped once it leaves that origin (dialogs fired during early page load, before the re-apply, are not caught). Set mode=off when done`);
+          send(msg.id, { result: head + (log.length ? '\n' + log.map(l => `[${l.type}] "${l.message}" → ${JSON.stringify(l.result)} @${l.url}`).join('\n') : '') });
           return;
         }
 

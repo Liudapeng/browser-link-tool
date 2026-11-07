@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Browser Link Tool",
-  "version": "1.6.0",
-  "version_name": "1.6.0+build.1793882103",
+  "version": "1.7.0",
+  "version_name": "1.7.0+build.1794051525",
   "description": "浏览器 MCP 控制桥：让 AI 助手远程操控任意网页（快照/点击/填充/导航/执行JS/长截图/等待/存储/Cookie）",
   "permissions": ["storage", "activeTab", "tabs", "scripting", "alarms", "cookies", "debugger", "downloads"],
   "host_permissions": ["<all_urls>"],

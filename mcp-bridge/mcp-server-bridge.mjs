@@ -9,6 +9,7 @@ import { fileURLToPath } from "url";
 import path from "path";
 import os from "os";
 import { spawn, execFileSync } from "child_process";
+import { createHash } from "crypto";
 
 // ─── 进程模型: 单实例常驻 daemon + 每会话一个轻量 client ───
 // daemon(`--daemon`):全机唯一,独占 WebSocket(:48765,扩展连入、长连接) + HTTP(:48766);
@@ -16,6 +17,10 @@ import { spawn, execFileSync } from "child_process";
 // client(默认,agent 以 stdio 拉起):不占端口,每次工具调用都是一次临时 HTTP 请求转发给 daemon;
 //   启动时/调用时发现 daemon 不在就拉起一个,发现 daemon 版本比自己旧就让它退出后换新。
 const IS_DAEMON = process.argv.includes('--daemon');
+// CLI 模式:带子命令(`blt click "#btn"`)或在终端里裸跑。agent 以 stdio 拉起时既无参数、stdin 也不是 TTY → MCP 模式。
+// `--mcp` 强制 MCP 模式(终端里手动调试 MCP 握手用)
+const CLI_ARGV = process.argv.slice(2);
+const IS_CLI = !IS_DAEMON && CLI_ARGV[0] !== '--mcp' && (CLI_ARGV.length > 0 || !!process.stdin.isTTY);
 
 // 端口可经环境变量覆盖,仅供本地测试(扩展固定连 48765,改了扩展就连不上)
 const WS_PORT = Number(process.env.BRIDGE_WS_PORT) || 48765;
@@ -106,10 +111,14 @@ function detectProject() {
   return (cwd === os.homedir() || cwd === '/') ? '' : path.basename(cwd);
 }
 const STARTED_AT = Date.now();
-const SESSION_ID = `${process.pid}-${STARTED_AT}`;
-const PROC_CLIENT = IS_DAEMON ? {} : detectClientFromProcess(); // agent 仅作无 clientInfo 时兜底;host 供面板展示
+// CLI 每条命令是一个新进程,会话 ID 必须跨进程稳定,否则每次调用都丢了 tab 绑定:
+// 默认按 cwd 派生(同一项目目录里的连续命令共享绑定),BLT_SESSION 可显式指定(多个脚本并行各用各的 tab)
+const SESSION_ID = IS_CLI
+  ? (process.env.BLT_SESSION || `cli-${createHash('sha1').update(process.cwd()).digest('hex').slice(0, 10)}`)
+  : `${process.pid}-${STARTED_AT}`;
+const PROC_CLIENT = (IS_DAEMON || IS_CLI) ? {} : detectClientFromProcess(); // agent 仅作无 clientInfo 时兜底;host 供面板展示。CLI 名字固定,省掉同步 ps 遍历
 // 握手前的兜底名;握手后由 upgradeClientName 换成 clientInfo
-let BRIDGE_CLIENT = (process.env.BRIDGE_CLIENT || '').trim() || PROC_CLIENT.agent || detectClientFromEnv();
+let BRIDGE_CLIENT = IS_CLI ? 'CLI' : ((process.env.BRIDGE_CLIENT || '').trim() || PROC_CLIENT.agent || detectClientFromEnv());
 const BRIDGE_PROJECT = IS_DAEMON ? '' : detectProject();
 // 会话身份头:随每次请求上报,daemon 据此维护会话表(面板展示)。header 只能 ASCII,中文目录名需编码
 const sessionHeaders = () => ({
@@ -247,22 +256,111 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "mcp_browser_navigate",
-    description: "控制目标标签页跳转到指定的完整网页 URL 地址。",
-    inputSchema: {
-      type: "object",
-      properties: { url: { type: "string", description: "需要跳转的合法的 HTTP/HTTPS 网址" }, ...TAB_TARGET_PROPS },
-      required: ["url"]
-    }
-  },
-  {
-    name: "mcp_browser_scrolling_screenshot",
-    description: "截取目标标签页当前可视区域一屏,保存为 PNG 并返回文件路径。",
+    description: "目标标签页导航:跳转 URL(默认)/后退/前进/刷新,默认等页面加载完成再返回(回报最终 url、title 与加载状态;超时不报错、如实回报 timeout)。SPA 路由跳转不触发整页加载,1.5s 内即返回,其后用 wait_for 等关键元素。",
     inputSchema: {
       type: "object",
       properties: {
-        output_path: { type: "string", description: "可选,保存截图的绝对路径。默认 /tmp/screenshot_<timestamp>.png" },
+        url: { type: "string", description: "要跳转的完整 URL。action=goto 时必填;缺省且未给 action 时视为 reload" },
+        action: { type: "string", enum: ["goto", "back", "forward", "reload"], description: "可选,默认 goto(有 url)/reload(无 url)" },
+        bypass_cache: { type: "boolean", description: "可选,reload 时绕过缓存(硬刷新)" },
+        wait: { type: "boolean", description: "可选,是否等加载完成,默认 true" },
+        timeout: { type: "number", description: "可选,等加载的最长毫秒,默认 30000" },
         ...TAB_TARGET_PROPS
       }
+    }
+  },
+  {
+    name: "mcp_browser_new_tab",
+    description: "在本会话当前 tab 所在窗口新开标签页(默认后台打开不抢焦点),并把本会话绑定到新 tab——之后不带 tabId 的调用都作用于它。用完 close_tab 关掉即还原到原 tab。适合不打扰用户当前页面地另开页面干活。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "可选,要打开的 URL;缺省开 about:blank" },
+        active: { type: "boolean", description: "可选,是否切到前台,默认 false(后台打开)。截图前会自动激活,无需为截图设 true" },
+        wait: { type: "boolean", description: "可选,有 url 时是否等加载完成,默认 true" },
+        timeout: { type: "number", description: "可选,等加载的最长毫秒,默认 30000" },
+        ...BROWSER_PROP
+      }
+    }
+  },
+  {
+    name: "mcp_browser_close_tab",
+    description: "关闭标签页。不带 tabId/url_match 时只关本会话经 new_tab 开出的当前绑定 tab(用户自己的页面会拒绝,防误关),关闭后本会话绑定还原到开 tab 前那个;显式带 tabId/url_match 则直接关闭该 tab。",
+    inputSchema: { type: "object", properties: { ...TAB_TARGET_PROPS } }
+  },
+  {
+    name: "mcp_browser_scrolling_screenshot",
+    description: "截图并保存为文件、返回路径(可随后 Read 查看)。默认截当前可视区一屏;full_page=true 截整页(超长页截前 16384 设备像素);selector 截单个元素(先滚入视口)。后台 tab 会先被激活。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        output_path: { type: "string", description: "可选,保存截图的绝对路径。默认 /tmp/screenshot_<timestamp>.<png|jpg>" },
+        full_page: { type: "boolean", description: "可选,截整页(含视口外内容)" },
+        selector: { type: "string", description: "可选,只截该元素(CSS 选择器)。可配合 frame 截 iframe 内元素" },
+        format: { type: "string", enum: ["png", "jpeg"], description: "可选,默认 png;长页面用 jpeg 体积小得多" },
+        quality: { type: "number", description: "可选,jpeg 质量 1-100,默认 80" },
+        ...TAB_TARGET_PROPS
+      }
+    }
+  },
+  {
+    name: "mcp_browser_drag",
+    description: "拖拽元素:拖到另一个元素(target_selector)上,或按像素偏移(offset_x/offset_y,滑块/画布/调整尺寸)。mode=auto 时源元素在 [draggable=true] 内走 HTML5 拖放(合成 DragEvent+DataTransfer),否则走 CDP 真实鼠标按下-移动-松开(pointer 类拖拽库/滑块验证)。结果须用 get_element/outline/截图核实。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string", description: "被拖元素(拖拽把手)的 CSS 选择器" },
+        target_selector: { type: "string", description: "放置目标元素的 CSS 选择器(与 offset_* 二选一)" },
+        offset_x: { type: "number", description: "水平拖动距离(px,可负)" },
+        offset_y: { type: "number", description: "垂直拖动距离(px,可负)" },
+        steps: { type: "number", description: "可选,移动分几步,默认 10;有阈值/动画的拖拽库可调大" },
+        hold_ms: { type: "number", description: "可选,到达终点后松开前停留毫秒,默认 0(某些库需要停顿才识别放置区)" },
+        mode: { type: "string", enum: ["auto", "mouse", "html5"], description: "可选,默认 auto" },
+        ...TAB_TARGET_PROPS
+      },
+      required: ["selector"]
+    }
+  },
+  {
+    name: "mcp_browser_upload_file",
+    description: "给 <input type=file> 设置本地文件(经 CDP,真实触发 input/change),替代无法自动化的系统文件选择框。selector 指向的不是 file input 时在其内部找;上传按钮常是隐藏 input 的包装,缺省用页面第一个 input[type=file]。设置后多数页面还要再点「上传/提交」。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        files: { type: "array", items: { type: "string" }, description: "本地文件路径数组(相对路径按 MCP 进程 cwd 解析,建议绝对路径)" },
+        selector: { type: "string", description: "可选,file input(或其容器)的 CSS 选择器,默认 input[type=file]" },
+        ...TAB_TARGET_PROPS
+      },
+      required: ["files"]
+    }
+  },
+  {
+    name: "mcp_browser_dialog",
+    description: "处理 JS 弹窗(alert/confirm/prompt)。⭐ 预期操作会弹 confirm/alert/prompt 时,先设 mode=auto_accept/auto_dismiss(可带 prompt_text),再执行触发操作——弹窗被就地自动应答、页面不阻塞;策略随页面刷新自动重设,直到 off 或该 tab 离开设置时的站点(origin);用完请 off;log 查看自动应答过的弹窗(类型/文案/结果)。accept/dismiss 只能应答 CDP 接管期间弹出的弹窗:事先没设 auto_* 就弹出的原生弹窗会卡住页面(其它工具超时),Chrome 不允许事后远程应答,工具会报 page is blocked,此时请用户手动关掉弹窗,再设 auto_* 重做。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["accept", "dismiss", "auto_accept", "auto_dismiss", "off", "log"], description: "accept/dismiss=应答当前已弹出的;auto_*=之后的自动应答;off=取消自动;log=看记录。默认 accept" },
+        prompt_text: { type: "string", description: "可选,prompt 弹窗的输入值(accept / auto_accept 时用)" },
+        ...TAB_TARGET_PROPS
+      }
+    }
+  },
+  {
+    name: "mcp_browser_batch",
+    description: "一次调用顺序执行多个浏览器工具,省掉多轮往返(如 fill 账号 → fill 密码 → click 登录 → wait_for 首页)。每步 {tool, args};tool 可省略 mcp_browser_ 前缀;另有伪步骤 {tool:\"sleep\", args:{ms}}。顶层 tabId/url_match/browser/frame 下发给未自带这些参数的步骤。默认遇错即停,返回逐步结果。不可嵌套 batch。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          items: { type: "object", properties: { tool: { type: "string" }, args: { type: "object" } }, required: ["tool"] },
+          description: "步骤列表,如 [{\"tool\":\"fill\",\"args\":{\"selector\":\"#u\",\"value\":\"a\"}},{\"tool\":\"click\",\"args\":{\"selector\":\"#go\"}}]"
+        },
+        stop_on_error: { type: "boolean", description: "可选,某步出错是否停止,默认 true" },
+        ...TAB_TARGET_PROPS
+      },
+      required: ["steps"]
     }
   },
   {
@@ -547,6 +645,11 @@ const TOOL_DEFINITIONS = [
   }
 ];
 
+// iframe 定向:元素/页面内容类工具统一追加 frame 参数(扩展侧 resolveFrameId 解析)
+const FRAME_PROP = { type: "string", description: "可选,在 iframe 内操作:iframe 元素的 CSS 选择器(如 \"#main-frame\")、frame URL 子串,或数字 frameId。缺省=顶层页面。outline 末尾会列出页面上的 iframe" };
+const FRAME_TOOLS = new Set(['snapshot', 'evaluate', 'click', 'fill', 'wait_for', 'outline', 'get_element', 'select_option', 'press_key', 'hover', 'scroll_to', 'inspect_element', 'dom_tree', 'detect_env', 'get_console', 'get_network', 'get_storage', 'set_storage', 'drag', 'upload_file', 'scrolling_screenshot', 'batch'].map(n => 'mcp_browser_' + n));
+for (const d of TOOL_DEFINITIONS) if (FRAME_TOOLS.has(d.name)) d.inputSchema.properties.frame = FRAME_PROP;
+
 // ─── 工具 → HTTP 路由 + 载荷映射 ───
 // bodyFn 接收 args，返回请求体字符串（GET 返回 null）
 function pickTabTargets(args) {
@@ -554,7 +657,21 @@ function pickTabTargets(args) {
   if (args.tabId != null) t.tabId = args.tabId;
   if (args.url_match != null) t.url_match = args.url_match;
   if (args.browser != null && String(args.browser).trim()) t.browser = String(args.browser).trim(); // daemon 消费,不下发扩展
+  if (args.frame != null && String(args.frame).trim()) t.frame = String(args.frame).trim();
   return t;
+}
+
+// upload_file 的路径在 client 侧解析:扩展/浏览器不知道 agent 的 cwd,且提前查不存在比 CDP 报错直白
+function resolveUploadFiles(files) {
+  const list = Array.isArray(files) ? files : (files ? [files] : []);
+  if (!list.length) throw new Error('files must be a non-empty array of file paths');
+  return list.map((f) => {
+    const p = path.resolve(String(f).replace(/^~(?=$|\/)/, os.homedir()));
+    let st;
+    try { st = fs.statSync(p); } catch { throw new Error(`file not found: ${p}`); }
+    if (!st.isFile()) throw new Error(`not a regular file: ${p}`);
+    return p;
+  });
 }
 
 const TOOL_ROUTES = {
@@ -562,7 +679,12 @@ const TOOL_ROUTES = {
   mcp_browser_evaluate: { path: '/eval', method: 'POST', bodyFn: (a) => JSON.stringify({ code: a.code, ...pickTabTargets(a) }) },
   mcp_browser_click: { path: '/click', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, ...pickTabTargets(a) }) },
   mcp_browser_fill: { path: '/fill', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, value: a.value, ...pickTabTargets(a) }) },
-  mcp_browser_navigate: { path: '/navigate', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url, ...pickTabTargets(a) }) },
+  mcp_browser_navigate: { path: '/navigate', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url, nav_action: a.action, bypass_cache: a.bypass_cache, wait: a.wait, timeout: a.timeout, ...pickTabTargets(a) }) },
+  mcp_browser_new_tab: { path: '/new_tab', method: 'POST', bodyFn: (a) => JSON.stringify({ url: a.url, active: a.active, wait: a.wait, timeout: a.timeout, ...pickTabTargets({ browser: a.browser }) }) },
+  mcp_browser_close_tab: { path: '/close_tab', method: 'POST', bodyFn: (a) => JSON.stringify(pickTabTargets(a)) },
+  mcp_browser_drag: { path: '/drag', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, target_selector: a.target_selector, offset_x: a.offset_x, offset_y: a.offset_y, steps: a.steps, hold_ms: a.hold_ms, mode: a.mode, ...pickTabTargets(a) }) },
+  mcp_browser_upload_file: { path: '/upload_file', method: 'POST', bodyFn: (a) => JSON.stringify({ files: resolveUploadFiles(a.files), selector: a.selector, ...pickTabTargets(a) }) },
+  mcp_browser_dialog: { path: '/dialog', method: 'POST', bodyFn: (a) => JSON.stringify({ mode: a.mode, prompt_text: a.prompt_text, ...pickTabTargets(a) }) },
   mcp_browser_list_tabs: { path: '/list_tabs', method: 'POST', bodyFn: (a) => JSON.stringify(pickTabTargets({ browser: a.browser })) },
   mcp_browser_activate_tab: { path: '/activate_tab', method: 'POST', bodyFn: (a) => JSON.stringify(pickTabTargets(a)) },
   mcp_browser_wait_for: { path: '/wait_for', method: 'POST', bodyFn: (a) => JSON.stringify({ selector: a.selector, text: a.text, visible: a.visible, timeout: a.timeout, ...pickTabTargets(a) }) },
@@ -594,6 +716,11 @@ const HTTP_ACTION_MAP = {
   '/click': 'click',
   '/fill': 'fill',
   '/navigate': 'navigate',
+  '/new_tab': 'new_tab',
+  '/close_tab': 'close_tab',
+  '/drag': 'drag',
+  '/upload_file': 'upload_file',
+  '/dialog': 'dialog',
   '/scrolling_screenshot': 'scrolling_screenshot',
   '/list_tabs': 'list_tabs',
   '/activate_tab': 'activate_tab',
@@ -723,14 +850,20 @@ function setupDaemon(wssHttpServer, httpServer, onShutdown) {
     if (action === 'wait_for' || action === 'js_grep') return 65000;
     if (action === 'arthas_exec') return Math.max((payload.timeout || 60000) + 5000, 65000);
     if (action === 'download') return Math.max((payload.timeoutMs || 60000) + 5000, 65000);
+    if (action === 'navigate' || action === 'new_tab') return (Number(payload.timeout) || 30000) + 5000;
+    // upload_file 扩展侧 CDP 超时累计 10+10+15s,daemon 必须更长,否则先报超时、扩展却仍把文件设上,agent 重试即重复上传
+    if (action === 'upload_file') return 45000;
+    if (action === 'drag' || action === 'dialog') return 30000;
     return 15000;
   }
+  // 超时的最常见隐因:页面弹着 alert/confirm,JS 被阻塞、注入脚本挂住。直接把出路写进报错
+  const TIMEOUT_HINT = ' — if the page may be showing a native JS dialog (alert/confirm/prompt), it blocks the page and cannot be answered remotely after the fact: ask the user to close it, then call mcp_browser_dialog mode=auto_accept/auto_dismiss BEFORE repeating the action';
   // 向某个浏览器下发一条 action,resolve 扩展回包(超时/断连也 resolve 成 {error},不 reject)
   function dispatch(b, action, payload, sid) {
     return new Promise((resolve) => {
       const id = currentId++;
       const timer = setTimeout(() => {
-        if (pendingRequests.delete(id)) resolve({ error: "Request timed out", __status: 504 });
+        if (pendingRequests.delete(id)) resolve({ error: "Request timed out" + (action === 'arthas_exec' || action === 'dialog' ? '' : TIMEOUT_HINT), __status: 504 });
       }, actionTimeout(action, payload));
       pendingRequests.set(id, { entry: b, resolve: (r) => { clearTimeout(timer); resolve(r); } });
       // __session 随 action 下发扩展,供扩展按会话维度绑定/解析目标 tab(每会话独立)
@@ -1071,20 +1204,25 @@ function setupDaemon(wssHttpServer, httpServer, onShutdown) {
   };
 }
 
-// ─── 单屏截图 ───
+// ─── 截图:扩展回 dataUrl,client 落盘 ───
 async function runScrollingScreenshot(args) {
-  const outputPath = args.output_path || `/tmp/screenshot_${Date.now()}.png`;
+  const format = (args.format === 'jpeg' || args.format === 'jpg') ? 'jpeg' : 'png';
+  const outputPath = args.output_path
+    ? path.resolve(String(args.output_path).replace(/^~(?=$|\/)/, os.homedir()))
+    : `/tmp/screenshot_${Date.now()}.${format === 'jpeg' ? 'jpg' : 'png'}`;
   const responseText = await proxyHttpRequest('/scrolling_screenshot', 'POST', JSON.stringify({
+    full_page: args.full_page, selector: args.selector, format, quality: args.quality,
     ...pickTabTargets(args)
   }));
   const response = JSON.parse(responseText);
   if (response.error) {
     return { content: [{ type: "text", text: `Error: ${response.error}` }], isError: true };
   }
-  const { dataUrl } = JSON.parse(response.result);
+  const { dataUrl, note } = JSON.parse(response.result);
   const buf = Buffer.from(String(dataUrl).replace(/^data:image\/\w+;base64,/, ''), 'base64');
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, buf);
-  return { content: [{ type: "text", text: `Screenshot saved to: ${outputPath}` }] };
+  return { content: [{ type: "text", text: `Screenshot saved to: ${outputPath}` + (note ? `\nnote: ${note}` : '') }] };
 }
 
 // ─── client 名升级:握手后一律以 clientInfo 为准(覆盖 BRIDGE_CLIENT/进程链等兜底值) ───
@@ -1165,61 +1303,129 @@ async function runConnectionInfo() {
 }
 
 // ─── 通用工具调用(client 侧:每次调用一个临时 HTTP 请求转发给 daemon) ───
+const errResult = (msg) => ({ content: [{ type: "text", text: `Error: ${msg}` }], isError: true });
+// 工具名容错:CLI / batch 里允许省略 mcp_browser_ 前缀,另有几个顺手的别名
+const TOOL_ALIASES = { eval: 'evaluate', js: 'evaluate', screenshot: 'scrolling_screenshot', shot: 'scrolling_screenshot', tabs: 'list_tabs', status: 'connection_info', info: 'connection_info', goto: 'navigate', open: 'new_tab', close: 'close_tab', upload: 'upload_file', key: 'press_key', wait: 'wait_for' };
+function normalizeToolName(name) {
+  let n = String(name || '').trim().replace(/-/g, '_');
+  if (n.startsWith('mcp__')) n = n.slice(n.lastIndexOf('__') + 2); // agent 侧带 server 前缀的全名
+  if (n.startsWith('mcp_browser_')) n = n.slice('mcp_browser_'.length);
+  return 'mcp_browser_' + (TOOL_ALIASES[n] || n);
+}
+
+// 调用前探活:daemon 不在(被杀/崩溃/空闲退出)就就地拉起;刚起的 daemon 等扩展重连一下。返回 { health } 或 { error }
+async function preflight() {
+  let { state, health } = await fetchHealth();
+  // 比自己旧的 daemon 也就地换代:CLI 没有 MCP client 那样的启动期 ensureDaemon,不在这里换就永远调到旧 daemon
+  if (state === 'none' || (state === 'daemon' && isOlderThanMe(health))) ({ state, health } = await ensureDaemon());
+  if (state === 'daemon' && !health.connected && Date.now() - (health.daemonSince || 0) < DAEMON_FRESH_MS) {
+    ({ state, health } = await waitExtensionConnected(EXT_RECONNECT_WAIT_MS));
+  }
+  if (state === 'none') return { error: errResult(`Bridge daemon on :${HTTP_PORT} is unreachable and could not be (re)started; see ${DAEMON_LOG}. Ask the user to check it (do NOT switch to another browser tool).`) };
+  if (state === 'foreign') return { error: errResult(`Port ${HTTP_PORT} is occupied by a non-browser-link service; cannot forward.`) };
+  if (!health.connected) return { error: errResult("Bridge daemon reports no Chrome Extension connected. Ask the user to check the extension popup shows 'connected'.") };
+  return { health };
+}
+
+// 执行单个工具(已过 preflight)。工具未知/参数错误返回 isError 结果,不抛
+async function execTool(toolName, args) {
+  if (toolName === 'mcp_browser_connection_info') return runConnectionInfo();
+  if (toolName === 'mcp_browser_scrolling_screenshot') return runScrollingScreenshot(args);
+  if (toolName === 'mcp_browser_batch') return runBatch(args);
+  const route = TOOL_ROUTES[toolName];
+  if (!route) return errResult(`Unknown tool ${toolName}`);
+  const body = route.bodyFn ? route.bodyFn(args) : null;
+  const responseText = await proxyHttpRequest(route.path, route.method, body);
+  try {
+    const parsed = JSON.parse(responseText);
+    if (parsed.error) {
+      const extra = parsed.diag ? `\n${JSON.stringify(parsed.diag, null, 2)}` : '';
+      return errResult(`${parsed.error}${extra}`);
+    }
+    // 不能写 parsed.result || responseText:空串/0/false 是合法结果(如空输入框的 value),会漏出整个响应信封
+    if (parsed.html) return { content: [{ type: "text", text: parsed.html }] };
+    if (parsed.result !== undefined && parsed.result !== null) {
+      const r = parsed.result;
+      return { content: [{ type: "text", text: r === '' ? '""' : (typeof r === 'string' ? r : JSON.stringify(r)) }] };
+    }
+    return { content: [{ type: "text", text: responseText }] };
+  } catch {
+    return { content: [{ type: "text", text: responseText }] };
+  }
+}
+
+// batch:client 侧顺序执行,每步仍是一次独立 HTTP 调用(daemon/扩展无需感知 batch)
+const BATCH_MAX_STEPS = 50;
+const BATCH_STEP_TEXT_MAX = 4000;
+async function runBatch(args) {
+  const steps = Array.isArray(args.steps) ? args.steps : [];
+  if (!steps.length) return errResult('steps must be a non-empty array of {tool, args}');
+  if (steps.length > BATCH_MAX_STEPS) return errResult(`too many steps (${steps.length} > ${BATCH_MAX_STEPS})`);
+  const stopOnError = args.stop_on_error !== false;
+  const inherit = pickTabTargets(args);
+  const lines = [];
+  let failed = 0;
+  for (let i = 0; i < steps.length; i++) {
+    const st = steps[i] || {};
+    const label = String(st.tool || '?');
+    const name = normalizeToolName(st.tool);
+    const a = { ...(st.args && typeof st.args === 'object' ? st.args : {}) };
+    let r;
+    try {
+      if (name === 'mcp_browser_sleep') {
+        const ms = Math.max(0, Math.min(60000, Number(a.ms) || 0));
+        await sleep(ms);
+        r = { content: [{ type: "text", text: `slept ${ms}ms` }] };
+      } else if (name === 'mcp_browser_batch') {
+        r = errResult('nested batch is not allowed');
+      } else {
+        // tab 定向成组继承:步骤自带 tabId 或 url_match 任一,就不再继承另一个(避免两者打架)
+        if (a.tabId == null && a.url_match == null) {
+          if (inherit.tabId != null) a.tabId = inherit.tabId;
+          if (inherit.url_match != null) a.url_match = inherit.url_match;
+        }
+        if (a.browser == null && inherit.browser != null) a.browser = inherit.browser;
+        if (a.frame == null && inherit.frame != null) a.frame = inherit.frame;
+        r = await execTool(name, a);
+      }
+    } catch (e) {
+      r = errResult(e.message);
+    }
+    let text = (r.content || []).map(c => c.text).join('\n');
+    if (text.length > BATCH_STEP_TEXT_MAX) text = text.slice(0, BATCH_STEP_TEXT_MAX) + `… (${text.length} chars, truncated; run this step alone for full output)`;
+    lines.push(`[${i + 1}] ${label} ${r.isError ? '✗' : '✓'}\n${text}`);
+    if (r.isError) {
+      failed++;
+      if (stopOnError) {
+        if (i < steps.length - 1) lines.push(`(stopped: ${steps.length - i - 1} remaining step(s) not run; pass stop_on_error=false to continue past errors)`);
+        break;
+      }
+    }
+  }
+  return { content: [{ type: "text", text: `batch: ${steps.length} step(s), ${failed} failed\n\n${lines.join('\n\n')}` }], isError: failed > 0 };
+}
+
 async function callTool(request) {
-  const toolName = request.params.name;
+  const toolName = normalizeToolName(request.params.name);
   const args = request.params.arguments || {};
   upgradeClientName();
 
   // 诊断工具排在所有校验之前:扩展没连上、版本对不上时它才最该用
   if (toolName === 'mcp_browser_connection_info') {
     try { return await runConnectionInfo(); }
-    catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true }; }
+    catch (e) { return errResult(e.message); }
+  }
+  if (!TOOL_ROUTES[toolName] && toolName !== 'mcp_browser_scrolling_screenshot' && toolName !== 'mcp_browser_batch') {
+    return errResult(`Unknown tool ${request.params.name}`);
   }
 
-  // 调用前探活:daemon 不在(被杀/崩溃/空闲退出)就就地拉起;刚起的 daemon 等扩展重连一下
-  let { state, health } = await fetchHealth();
-  if (state === 'none') ({ state, health } = await ensureDaemon());
-  if (state === 'daemon' && !health.connected && Date.now() - (health.daemonSince || 0) < DAEMON_FRESH_MS) {
-    ({ state, health } = await waitExtensionConnected(EXT_RECONNECT_WAIT_MS));
-  }
-  if (state === 'none') {
-    return { content: [{ type: "text", text: `Error: Bridge daemon on :${HTTP_PORT} is unreachable and could not be (re)started; see ${DAEMON_LOG}. Ask the user to check it (do NOT switch to another browser tool).` }], isError: true };
-  }
-  if (state === 'foreign') {
-    return { content: [{ type: "text", text: `Error: Port ${HTTP_PORT} is occupied by a non-browser-link service; cannot forward.` }], isError: true };
-  }
-  if (!health.connected) {
-    return { content: [{ type: "text", text: "Error: Bridge daemon reports no Chrome Extension connected. Ask the user to check the extension popup shows 'connected'." }], isError: true };
-  }
-
-  const warn = versionWarning(health);
-
-  if (toolName === 'mcp_browser_scrolling_screenshot') {
-    try {
-      return withWarning(await runScrollingScreenshot(args), warn);
-    } catch (e) {
-      return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
-    }
-  }
-
-  const route = TOOL_ROUTES[toolName];
-  if (!route) throw new Error("Tool not found");
-
+  const pre = await preflight();
+  if (pre.error) return pre.error;
+  const warn = versionWarning(pre.health);
   try {
-    const body = route.bodyFn ? route.bodyFn(args) : null;
-    const responseText = await proxyHttpRequest(route.path, route.method, body);
-    try {
-      const parsed = JSON.parse(responseText);
-      if (parsed.error) {
-        const extra = parsed.diag ? `\n${JSON.stringify(parsed.diag, null, 2)}` : '';
-        return withWarning({ content: [{ type: "text", text: `Error: ${parsed.error}${extra}` }], isError: true }, warn);
-      }
-      return withWarning({ content: [{ type: "text", text: parsed.html || parsed.result || responseText }] }, warn);
-    } catch {
-      return withWarning({ content: [{ type: "text", text: responseText }] }, warn);
-    }
+    return withWarning(await execTool(toolName, args), warn);
   } catch (e) {
-    return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    return errResult(e.message);
   }
 }
 
@@ -1404,5 +1610,176 @@ async function runClient() {
   process.on('SIGTERM', exit);
 }
 
+// ─── CLI 主流程(`blt <tool> ...`:不走 MCP,脚本/任意 agent 的 shell 直接调,与 MCP 共用同一个 daemon) ───
+// 位置参数默认按 schema.required 顺序映射;下表覆盖 required 为空、但有一个"主参数"的工具
+const CLI_POSITIONAL = { navigate: ['url'], new_tab: ['url'], close_tab: ['tabId'], activate_tab: ['tabId'], outline: ['scope'], dom_tree: ['scope'], inspect_element: ['selector'], get_cookies: ['url'], get_storage: ['key'], scrolling_screenshot: ['output_path'], dialog: ['mode', 'prompt_text'] };
+const CLI_HELP = `blt — Browser Link Tool 命令行(与 MCP 工具同源,共用常驻 daemon)
+
+用法:
+  blt <tool> [位置参数...] [--key value] [--flag]   调用工具(tool 可省 mcp_browser_ 前缀)
+  blt <tool> '{"selector":"#go"}'                  也可直接给一个 JSON 参数对象
+  blt batch steps.json | '<JSON>' | -             批量:文件 / JSON 字面量 / stdin;支持 [..步骤] 或 {steps:[..],tabId..}
+  blt tools                                       列出全部工具
+  blt help <tool>                                 查看某工具参数
+  blt status                                      连接与版本诊断(= connection_info)
+
+示例:
+  blt tabs
+  blt open https://example.com --active
+  blt outline --url-match example.com
+  blt click "#submit" --tabId 123
+  blt fill "#q" "hello"
+  blt eval "document.title"
+  blt shot /tmp/a.png --full-page
+  blt dialog auto_accept
+
+环境变量:BLT_SESSION=<id> 指定会话(缺省按当前目录派生,同目录多次调用共享 tab 绑定);BLT_DEBUG=1 打印内部日志。
+退出码:成功 0;工具报错/参数错误 1。`;
+
+function cliToolDef(name) { return TOOL_DEFINITIONS.find(t => t.name === name); }
+function cliShortName(name) { return name.replace(/^mcp_browser_/, ''); }
+
+function cliCoerce(val, schema, key) {
+  const t = schema?.type;
+  if (val === true) {
+    if (!t || t === 'boolean') return true;
+    throw new Error(`--${key} 需要一个值`);
+  }
+  if (t === 'number' || t === 'integer') {
+    const n = Number(val);
+    if (!Number.isFinite(n)) throw new Error(`--${key} 需要数字,收到 ${val}`);
+    return n;
+  }
+  if (t === 'boolean') {
+    if (/^(true|1|yes|on)$/i.test(val)) return true;
+    if (/^(false|0|no|off)$/i.test(val)) return false;
+    throw new Error(`--${key} 需要 true/false,收到 ${val}`);
+  }
+  if (t === 'array' || t === 'object') {
+    try { return JSON.parse(val); }
+    catch { if (t === 'array') return [val]; throw new Error(`--${key} 需要 JSON 对象`); }
+  }
+  return val;
+}
+
+// 把 argv 解析成工具 args。flag 名容错:--url-match / --url_match / --urlmatch 都映射到 url_match
+function cliParseArgs(def, argv) {
+  const props = def.inputSchema?.properties || {};
+  const findKey = (raw) => {
+    if (props[raw]) return raw;
+    const norm = (s) => s.replace(/[-_]/g, '').toLowerCase();
+    return Object.keys(props).find(k => norm(k) === norm(raw)) || null;
+  };
+  const args = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--') && a.length > 2) {
+      let raw = a.slice(2), val;
+      const eq = raw.indexOf('=');
+      if (eq > 0) { val = raw.slice(eq + 1); raw = raw.slice(0, eq); }
+      const key = findKey(raw);
+      if (!key) throw new Error(`未知参数 --${raw}(可用:${Object.keys(props).join(', ') || '无'})`);
+      if (val === undefined) {
+        const next = argv[i + 1];
+        val = (props[key].type !== 'boolean' && next !== undefined && !(next.startsWith('--') && next.length > 2)) ? argv[++i] : true;
+        if (props[key].type === 'boolean' && next !== undefined && /^(true|false)$/i.test(next)) val = argv[++i];
+      }
+      args[key] = cliCoerce(val, props[key], key);
+    } else {
+      positional.push(a);
+    }
+  }
+  // 唯一一个 JSON 对象形式的位置参数 → 整体当 args;解析不了(如 eval '{ const a=1; return a }')就仍当普通位置参数
+  let parsedObj = null;
+  if (positional.length === 1 && /^\s*\{/.test(positional[0])) {
+    try { const o = JSON.parse(positional[0]); if (o && typeof o === 'object' && !Array.isArray(o)) parsedObj = o; } catch (_) {}
+  }
+  if (parsedObj) Object.assign(args, { ...parsedObj, ...args });
+  else {
+    const order = CLI_POSITIONAL[cliShortName(def.name)] || def.inputSchema?.required || [];
+    const slots = order.filter(k => args[k] === undefined);
+    for (let i = 0; i < positional.length; i++) {
+      const k = slots[i];
+      if (!k) throw new Error(`多余的位置参数: ${positional.slice(i).join(' ')}(位置参数依次对应 ${order.join(', ') || '无'})`);
+      // 数组型参数(如 upload_file 的 files)吞掉剩余全部位置参数
+      if (props[k]?.type === 'array') { args[k] = positional.slice(i); break; }
+      args[k] = cliCoerce(positional[i], props[k], k);
+    }
+  }
+  const missing = (def.inputSchema?.required || []).filter(k => args[k] === undefined);
+  if (missing.length) throw new Error(`缺少必填参数: ${missing.join(', ')}`);
+  return args;
+}
+
+function cliToolHelp(def) {
+  const props = def.inputSchema?.properties || {};
+  const req = new Set(def.inputSchema?.required || []);
+  const order = CLI_POSITIONAL[cliShortName(def.name)] || def.inputSchema?.required || [];
+  const lines = [`blt ${cliShortName(def.name)}${order.map(k => ` <${k}>`).join('')} [选项]`, '', def.description, '', '参数:'];
+  for (const [k, p] of Object.entries(props)) {
+    lines.push(`  --${k}${req.has(k) ? ' (必填)' : ''}  [${p.type || 'any'}${p.enum ? ': ' + p.enum.join('|') : ''}]  ${(p.description || '').replace(/\s+/g, ' ')}`);
+  }
+  return lines.join('\n');
+}
+
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function runCli(argv) {
+  // macOS 下写管道是异步的,写完立刻 process.exit 会截断大输出(blt snapshot | grep / > file)。
+  // 置为阻塞写,保留各处 fail()/exit 的同步「到此为止」语义
+  for (const s of [process.stdout, process.stderr]) { try { s._handle?.setBlocking?.(true); } catch (_) {} }
+  const out = (s) => process.stdout.write(s.endsWith('\n') ? s : s + '\n');
+  const fail = (s) => { process.stderr.write(`blt: ${s}\n`); process.exit(1); };
+  // 内部诊断日志(拉 daemon、换代等)默认静音,别污染脚本的 stderr
+  if (!process.env.BLT_DEBUG) console.error = () => {};
+  process.on('unhandledRejection', (e) => fail(e?.message || String(e)));
+
+  const [cmd0, ...rest] = argv;
+  if (!cmd0 || cmd0 === 'help' || cmd0 === '-h' || cmd0 === '--help') {
+    if (rest[0]) {
+      const def = cliToolDef(normalizeToolName(rest[0]));
+      if (!def) fail(`未知工具 ${rest[0]},用 blt tools 查看全部`);
+      out(cliToolHelp(def));
+    } else out(CLI_HELP);
+    process.exit(0);
+  }
+  if (cmd0 === '-v' || cmd0 === '--version' || cmd0 === 'version') { out(VERSION); process.exit(0); }
+  if (cmd0 === 'tools') {
+    out(TOOL_DEFINITIONS.map(t => `${cliShortName(t.name).padEnd(22)} ${t.description.split(/[。.!?;(]/)[0].slice(0, 70)}`).join('\n'));
+    process.exit(0);
+  }
+
+  const toolName = normalizeToolName(cmd0);
+  const def = cliToolDef(toolName);
+  if (!def) fail(`未知命令/工具 ${cmd0},用 blt tools 查看全部`);
+
+  let args;
+  try {
+    if (toolName === 'mcp_browser_batch' && rest[0] && !rest[0].startsWith('--')) {
+      // batch 的主参数是整份 JSON:文件路径 / 字面量 / '-' 读 stdin
+      const src = rest[0];
+      const text = src === '-' ? await readStdin() : (/^\s*[[{]/.test(src) ? src : fs.readFileSync(path.resolve(src), 'utf8'));
+      const parsed = JSON.parse(text);
+      args = { ...(Array.isArray(parsed) ? { steps: parsed } : parsed), ...cliParseArgs({ ...def, inputSchema: { ...def.inputSchema, required: [] } }, rest.slice(1)) };
+    } else {
+      args = cliParseArgs(def, rest);
+    }
+  } catch (e) {
+    fail(`${e.message}\n\n${cliToolHelp(def)}`);
+  }
+
+  const result = await callTool({ params: { name: toolName, arguments: args } });
+  const text = (result.content || []).map(c => c.text).join('\n');
+  if (result.isError) { process.stderr.write(text + '\n'); process.exit(1); }
+  out(text);
+  process.exit(0);
+}
+
 if (IS_DAEMON) await runDaemon();
+else if (IS_CLI) await runCli(CLI_ARGV);
 else await runClient();
