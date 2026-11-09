@@ -413,7 +413,10 @@ function needsFnWrap(code) {
 // attach 会话复用：hover/press_key 需连发多条 Input 命令，逐条 attach/detach 会让顶部
 // 调试黄条反复闪烁。故一次操作内复用同一会话，并在空闲后延迟 detach——既不闪也不常驻。
 const CDP_IDLE_DETACH_MS = 1500;
-const cdpSessions = new Map();   // tabId -> { refs:number, timer:number|null }
+// 兜底:任何持有者挂住不 release(CDP 命令永不返回),顶部「已开始调试此浏览器」黄条就会常驻。
+// 超过该时长(> 最长的 action 超时 120s)仍未释放的会话由 keepAlive 定时强制 detach
+const CDP_MAX_HOLD_MS = 180000;
+const cdpSessions = new Map();   // tabId -> { refs:number, timer:number|null, last:number }
 
 async function cdpAcquire(tabId) {
   const s = cdpSessions.get(tabId);
@@ -421,6 +424,7 @@ async function cdpAcquire(tabId) {
     // 已有会话：取消待执行的 detach，引用计数 +1
     if (s.timer) { clearTimeout(s.timer); s.timer = null; }
     s.refs++;
+    s.last = Date.now();
     return true;
   }
   try {
@@ -430,8 +434,20 @@ async function cdpAcquire(tabId) {
     // is already attached"。此时无法复用也无法抢占，直接判定 CDP 不可用 → 调用方降级。
     return false;
   }
-  cdpSessions.set(tabId, { refs: 1, timer: null });
+  cdpSessions.set(tabId, { refs: 1, timer: null, last: Date.now() });
   return true;
+}
+
+// 强制回收挂住的会话:持有者之后再 cdpRelease 时查不到登记,直接 no-op
+function cdpReapStuck() {
+  const now = Date.now();
+  for (const [tabId, s] of cdpSessions) {
+    if (s.refs > 0 && now - s.last > CDP_MAX_HOLD_MS) {
+      if (s.timer) clearTimeout(s.timer);
+      cdpSessions.delete(tabId);
+      chrome.debugger.detach({ tabId }).catch(() => {});
+    }
+  }
 }
 
 function cdpRelease(tabId) {
@@ -544,10 +560,11 @@ async function pressKeyViaCDP(tabId, selector, key, injTarget) {
       nativeVirtualKeyCode: desc.vk || undefined
     };
     // 有 text 的键用 keyDown（带 text 才录入字符）；纯控制键用 rawKeyDown（避免插入控制符）
-    await cdpSend(tabId, 'Input.dispatchKeyEvent', desc.text
+    // 按键处理器若弹出 alert(如 Enter 提交后提示),dispatchKeyEvent 会一直挂到弹窗关闭,必须限时
+    await withTimeout(cdpSend(tabId, 'Input.dispatchKeyEvent', desc.text
       ? { type: 'keyDown', text: desc.text, unmodifiedText: desc.text, ...common }
-      : { type: 'rawKeyDown', ...common });
-    await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common });
+      : { type: 'rawKeyDown', ...common }), 5000, 'dispatchKeyEvent');
+    await withTimeout(cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common }), 5000, 'dispatchKeyEvent');
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: 'cdp_error: ' + (e && e.message) };
@@ -563,6 +580,7 @@ async function pressKeyViaCDP(tabId, selector, key, injTarget) {
 //   1. 含顶层 return → `(async()=>{ code })()` 语句块函数模式；
 //   2. 否则先试 `(async()=>( code ))()` 箭头函数体表达式模式（拿完成值 + 支持 await 表达式）；
 //   3. 表达式模式语法失败（多语句/声明）→ 退回 `(async()=>{ code })()` 语句块模式（末表达式无 return 则得 undefined，最坏退化）。
+const EVAL_CDP_TIMEOUT_MS = 13000;
 async function evaluateViaDebugger(tabId, code) {
   const target = { tabId };
   const wrap = needsFnWrap(code);
@@ -573,15 +591,25 @@ async function evaluateViaDebugger(tabId, code) {
   // hover/press_key 的 CDP 会话有 1.5s 空闲延迟期，期间若此处独立 attach 会因
   // "Another debugger is already attached" 失败。复用引用计数可避免该撞车。
   if (!(await cdpAcquire(tabId))) throw new Error('debugger attach failed');
-  const evalOnce = (expression) => chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+  // awaitPromise 下页面 Promise 永不 settle(fetch 挂住、死等某条件)或页面被 alert 阻塞时,
+  // Runtime.evaluate 永不返回 → finally 走不到 → 会话不释放、调试黄条常驻(实测)。
+  // 限时须短于 daemon 的 15s,让 agent 拿到的是这条可行动的报错而非泛化超时
+  const evalOnce = (expression) => withTimeout(chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
     expression, returnByValue: true, awaitPromise: true, userGesture: true
-  });
+  }), EVAL_CDP_TIMEOUT_MS, 'Runtime.evaluate');
   try {
-    let res = await evalOnce(wrap ? stmtExpr : exprExpr);
-    // 表达式模式遇语法错误（多语句/顶层声明）→ 退回语句块模式重试，绝不因判定失误直接报错。
-    if (!wrap && res && res.exceptionDetails
-        && /SyntaxError/.test((res.exceptionDetails.exception && res.exceptionDetails.exception.description) || res.exceptionDetails.text || '')) {
-      res = await evalOnce(stmtExpr);
+    let res;
+    try {
+      res = await evalOnce(wrap ? stmtExpr : exprExpr);
+      // 表达式模式遇语法错误（多语句/顶层声明）→ 退回语句块模式重试，绝不因判定失误直接报错。
+      if (!wrap && res && res.exceptionDetails
+          && /SyntaxError/.test((res.exceptionDetails.exception && res.exceptionDetails.exception.description) || res.exceptionDetails.text || '')) {
+        res = await evalOnce(stmtExpr);
+      }
+    } catch (e) {
+      // 超时不能抛给调用方:那会退到注入路径把代码再执行一遍(SQL/写操作重复执行)
+      if (/timed out/.test(e && e.message)) return `Error: evaluate did not settle within ${EVAL_CDP_TIMEOUT_MS / 1000}s (awaited promise still pending, or page blocked by a native dialog); debugger released. The code may still be running in the page — do not blindly re-run side-effecting code`;
+      throw e;
     }
     if (res && res.exceptionDetails) {
       const ex = res.exceptionDetails;
@@ -2530,5 +2558,6 @@ chrome.alarms.create('keepAlive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'keepAlive') {
     if (!socket || socket.readyState === WebSocket.CLOSED) connect();
+    cdpReapStuck();
   }
 });
